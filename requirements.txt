@@ -1,0 +1,6 @@
+groq>=0.4.0
+SpeechRecognition>=3.10.0
+PyAudio>=0.2.14
+edge-tts>=6.1.0
+pygame>=2.5.0
+python-dotenv>=1.0.0

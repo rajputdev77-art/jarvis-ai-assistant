@@ -29,3 +29,9 @@ desktop.ini
 # Temp files
 *.mp3
 *.tmp
+
+# JARVIS runtime artifacts
+jarvis_runtime.log
+browser_data/
+memory_db/
+jarvis_*.png

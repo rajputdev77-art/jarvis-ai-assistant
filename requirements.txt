@@ -1,6 +1,22 @@
-groq>=0.4.0
+# ── Core brain & voice (Phase 1-3) ──
+groq>=0.11.0
 SpeechRecognition>=3.10.0
 PyAudio>=0.2.14
 edge-tts>=6.1.0
 pygame>=2.5.0
 python-dotenv>=1.0.0
+numpy>=1.26.0
+
+# ── Long-term memory (Phase 2) ──
+mem0ai>=0.1.40
+qdrant-client>=1.9.0
+sentence-transformers>=2.7.0
+
+# ── Browser automation (Phase 3 + 4) ──
+playwright>=1.42.0
+browser-use>=0.1.40
+langchain-groq>=0.2.0
+
+# ── Vision + tray (Phase 4 — Goals 2 & 4) ──
+Pillow>=10.0.0
+pystray>=0.19.5

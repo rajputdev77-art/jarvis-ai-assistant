@@ -32,6 +32,9 @@ desktop.ini
 
 # JARVIS runtime artifacts
 jarvis_runtime.log
+hud_events.jsonl
 browser_data/
 memory_db/
 jarvis_*.png
+gmail_credentials.json
+gmail_token.json

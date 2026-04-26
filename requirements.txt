@@ -20,3 +20,13 @@ langchain-groq>=0.2.0
 # ── Vision + tray (Phase 4 — Goals 2 & 4) ──
 Pillow>=10.0.0
 pystray>=0.19.5
+
+# ── Phase 5: Generalist powers ──
+PyQt6>=6.6.0              # HUD glass overlay
+pywin32>=306              # Windows API access
+pygetwindow>=0.0.9        # Window enumeration / focus
+pyperclip>=1.8.2          # Clipboard read/write
+psutil>=5.9.0             # Process / CPU / RAM
+google-api-python-client>=2.100.0  # Gmail API
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.2.0

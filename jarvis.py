@@ -101,11 +101,40 @@ DYNAMIC_TOOLS_FILE = os.path.join(JARVIS_HOME, "dynamic_tools.py")
 GMAIL_TOKEN_FILE   = os.path.join(JARVIS_HOME, "gmail_token.json")
 GMAIL_CREDS_FILE   = os.path.join(JARVIS_HOME, "gmail_credentials.json")
 
-BRAIN_MODEL  = "llama-3.3-70b-versatile"
+# Brain model failover chain — Groq cloud (each model = separate quota)
+# Listed in priority order. Tool-use capable models only.
+GROQ_BRAIN_MODELS = [
+    "llama-3.3-70b-versatile",                          # primary — best reasoning
+    "meta-llama/llama-4-scout-17b-16e-instruct",        # newer, separate quota
+    "meta-llama/llama-4-maverick-17b-128e-instruct",    # newer, separate quota
+    "qwen/qwen3-32b",                                   # alt vendor, separate quota
+    "deepseek-r1-distill-llama-70b",                    # reasoning, separate quota
+]
+BRAIN_MODEL  = GROQ_BRAIN_MODELS[0]
 VISION_MODEL = "llama-3.2-11b-vision-preview"
 
+# Local Ollama fallback — UNLIMITED, free, runs on Mr. Stark's machine.
+# Set OLLAMA_ENABLED=False in .env to disable. Requires Ollama running on
+# default port 11434 with a tool-capable model pulled.
+OLLAMA_ENABLED   = os.environ.get("OLLAMA_ENABLED", "1") not in ("0", "false", "False")
+OLLAMA_BASE_URL  = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+OLLAMA_MODELS    = [   # tried in order; first one that exists locally is used
+    "qwen2.5-coder:14b",  # excellent tool-calling
+    "qwen2.5:14b", "qwen2.5:7b",
+    "llama3.1:8b",
+    "gemma4:latest",
+    "llama3.2:latest", "llama3.2:3b",
+    "gemma3:4b",
+    "mistral:7b",
+]
+
+# Rate-limit / retry behavior
+MAX_BRAIN_RETRIES = 8
+BACKOFF_BASE_S    = 3   # 3s, 6s, 12s, ...
+
 FOLLOWUP_WINDOW = 6
-REACT_MAX_ITER  = 15  # bumped — generalist tasks need more steps
+REACT_MAX_ITER  = 8   # capped — each iter is a model call, free tier is precious
+INTER_CALL_DELAY = 0.5  # tiny breath between brain calls to dodge per-second throttle
 TRAY_MODE       = True
 HUD_ENABLED     = True
 
@@ -822,7 +851,48 @@ def take_screenshot(save_path: str = None) -> str:
         return f"Screenshot failed: {e}"
 
 
+VISION_MODELS = [
+    "llama-3.2-11b-vision-preview",
+    "llama-3.2-90b-vision-preview",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+]
+
+
 def analyze_screen(question: str = "What's on the screen?") -> str:
+    try:
+        b64 = _capture_screen_b64()
+    except Exception as e:
+        return f"Couldn't capture screen: {e}"
+    last_err = ""
+    for vm in VISION_MODELS:
+        try:
+            r = client.chat.completions.create(
+                model=vm,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text",
+                         "text": f"You are JARVIS analyzing Mr. Stark's screen. Be concise, "
+                                 f"technical, useful. Question: {question}"},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                    ],
+                }],
+                max_tokens=500, temperature=0.2,
+            )
+            return r.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = str(e)[:200]
+            log(f"  [vision {vm} failed: {last_err}]")
+            if not (_is_rate_limit_error(e) or _is_function_error(e)):
+                continue
+            time.sleep(2)
+            continue
+    return f"All vision models failed, sir: {last_err}"
+
+
+def _analyze_screen_legacy(question):
+    """Kept for backward reference — superseded by failover above."""
     try:
         b64 = _capture_screen_b64()
     except Exception as e:
@@ -1682,6 +1752,193 @@ def _all_tools():
     return TOOLS + _dynamic_specs
 
 
+# ── Resilient brain call: Groq failover + Ollama local fallback ──
+_brain_model_idx = 0
+_ollama_client    = None
+_ollama_model     = None
+_ollama_checked   = False
+
+
+def _is_rate_limit_error(err) -> bool:
+    s = str(err).lower()
+    return ("429" in s or "rate limit" in s or "rate_limit" in s
+            or "tpm" in s or "rpm" in s or "quota" in s)
+
+
+def _is_function_error(err) -> bool:
+    s = str(err).lower()
+    return ("failed to call a function" in s or "failed_generation" in s
+            or "tool_use_failed" in s)
+
+
+def _is_decommissioned(err) -> bool:
+    s = str(err).lower()
+    return "decommissioned" in s or "no longer supported" in s
+
+
+def _detect_ollama():
+    """Probe localhost:11434 for Ollama and pick the best available model."""
+    global _ollama_client, _ollama_model, _ollama_checked
+    if _ollama_checked:
+        return _ollama_client, _ollama_model
+    _ollama_checked = True
+    if not OLLAMA_ENABLED:
+        return None, None
+    try:
+        # List local models via Ollama's native API
+        url = OLLAMA_BASE_URL.replace("/v1", "") + "/api/tags"
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=2) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        installed = [m["name"] for m in data.get("models", [])]
+        if not installed:
+            log("  [Ollama running but no models installed]")
+            return None, None
+        # Pick the first preferred model that's installed (exact or prefix match)
+        chosen = None
+        for pref in OLLAMA_MODELS:
+            for inst in installed:
+                if inst == pref or inst.split(":")[0] == pref.split(":")[0]:
+                    chosen = inst
+                    break
+            if chosen:
+                break
+        if not chosen:
+            chosen = installed[0]   # fall back to whatever is installed
+        # Build OpenAI-compatible client pointing at Ollama
+        from groq import Groq as _GroqClient   # the openai-compatible client works
+        # Actually use openai's client since groq client is hardcoded to api.groq.com
+        try:
+            from openai import OpenAI
+            _ollama_client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+        except ImportError:
+            # Try installing openai on the fly is too risky here; use raw http
+            _ollama_client = _OllamaRawClient(OLLAMA_BASE_URL)
+        _ollama_model = chosen
+        log(f"  Ollama fallback ............. ONLINE ({chosen})")
+        return _ollama_client, _ollama_model
+    except Exception as e:
+        log(f"  Ollama fallback ............. OFFLINE ({str(e)[:80]})")
+        return None, None
+
+
+class _OllamaRawClient:
+    """Minimal Ollama client mimicking the .chat.completions.create signature."""
+    def __init__(self, base_url):
+        self.base_url = base_url.rstrip("/")
+        # Mimic OpenAI client structure
+        self.chat = self
+        self.completions = self
+    def create(self, model, messages, tools=None, tool_choice=None,
+               temperature=0.4, max_tokens=None):
+        payload = {"model": model, "messages": messages,
+                   "temperature": temperature, "stream": False}
+        if tools:
+            payload["tools"] = tools
+        if tool_choice:
+            payload["tool_choice"] = tool_choice
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
+        url = self.base_url + "/chat/completions"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": "Bearer ollama"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return _DictNS(data)
+
+
+class _DictNS:
+    """Recursive dict-as-attribute wrapper to mimic OpenAI response objects."""
+    def __init__(self, d):
+        for k, v in d.items():
+            if isinstance(v, dict):
+                setattr(self, k, _DictNS(v))
+            elif isinstance(v, list):
+                setattr(self, k, [_DictNS(x) if isinstance(x, dict) else x for x in v])
+            else:
+                setattr(self, k, v)
+    def __getattr__(self, name):
+        return None
+
+
+def call_brain(messages, tools=None, tool_choice=None, temperature=0.4,
+               max_tokens=None):
+    """
+    Call Groq with model failover; on full Groq exhaustion, fall back to
+    locally-running Ollama. Ollama is unlimited and free — JARVIS keeps
+    thinking even when all cloud quotas are dry.
+    """
+    global _brain_model_idx
+    attempts = []
+    backoff = BACKOFF_BASE_S
+
+    # Phase 1: try Groq models
+    groq_tried = set()
+    while len(groq_tried) < len(GROQ_BRAIN_MODELS) and len(attempts) < MAX_BRAIN_RETRIES:
+        model = GROQ_BRAIN_MODELS[_brain_model_idx % len(GROQ_BRAIN_MODELS)]
+        if model in groq_tried:
+            _brain_model_idx = (_brain_model_idx + 1) % len(GROQ_BRAIN_MODELS)
+            continue
+        groq_tried.add(model)
+        try:
+            kwargs = {"model": model, "messages": messages, "temperature": temperature}
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = tool_choice or "auto"
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            resp = client.chat.completions.create(**kwargs)
+            if len(attempts) > 0 or _brain_model_idx != 0:
+                log(f"  [brain recovered on Groq:{model}]")
+            return resp
+        except Exception as e:
+            attempts.append(("groq:" + model, str(e)[:140]))
+            log(f"  [Groq:{model} failed: {str(e)[:140]}]")
+            hud_event("brain_retry", model=model, error=str(e)[:160])
+            if _is_decommissioned(e):
+                # Permanently drop this model from rotation for this session
+                try:
+                    GROQ_BRAIN_MODELS.remove(model)
+                except ValueError:
+                    pass
+            if _is_rate_limit_error(e):
+                _brain_model_idx = (_brain_model_idx + 1) % max(len(GROQ_BRAIN_MODELS), 1)
+                time.sleep(min(backoff, 12))
+                backoff *= 2
+                continue
+            # Other errors (400 tool format, 500 etc.) — just try next model
+            _brain_model_idx = (_brain_model_idx + 1) % max(len(GROQ_BRAIN_MODELS), 1)
+            time.sleep(1)
+            continue
+
+    # Phase 2: fall back to Ollama (unlimited, local)
+    oc, om = _detect_ollama()
+    if oc is not None and om is not None:
+        try:
+            log(f"  [brain falling back to Ollama:{om}]")
+            hud_event("brain_fallback", target="ollama", model=om)
+            kwargs = {"model": om, "messages": messages, "temperature": temperature}
+            if tools:
+                kwargs["tools"] = tools
+                kwargs["tool_choice"] = tool_choice or "auto"
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+            resp = oc.chat.completions.create(**kwargs)
+            log(f"  [brain recovered on Ollama:{om}]")
+            return resp
+        except Exception as e:
+            attempts.append(("ollama:" + om, str(e)[:140]))
+            log(f"  [Ollama:{om} failed: {str(e)[:140]}]")
+
+    log(f"  [brain exhausted. Attempts: {attempts}]")
+    return None
+
+
 def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
     set_status("thinking")
     hud_event("user_said", text=user_input)
@@ -1696,14 +1953,11 @@ def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
 
     final_text = None
     for step in range(max_iter):
-        try:
-            resp = client.chat.completions.create(
-                model=BRAIN_MODEL, messages=messages,
-                tools=_all_tools(), tool_choice="auto", temperature=0.4,
-            )
-        except Exception as e:
-            log(f"  [Brain error: {e}]")
-            final_text = f"Reasoning hiccuped, sir: {str(e)[:120]}"
+        resp = call_brain(messages, tools=_all_tools(), tool_choice="auto",
+                          temperature=0.4)
+        if resp is None:
+            final_text = ("All my reasoning models are rate-limited at the moment, sir. "
+                          "Try again in about a minute.")
             break
 
         msg = resp.choices[0].message
@@ -1745,6 +1999,7 @@ def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
             messages.append({"role": "tool", "tool_call_id": tc.id,
                              "name": name, "content": str(result)[:3000]})
         set_status("thinking")
+        time.sleep(INTER_CALL_DELAY)
     else:
         final_text = "Reached my action limit, sir. Want me to keep going?"
 

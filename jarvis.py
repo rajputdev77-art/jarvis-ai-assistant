@@ -101,6 +101,10 @@ DYNAMIC_TOOLS_FILE = os.path.join(JARVIS_HOME, "dynamic_tools.py")
 GMAIL_TOKEN_FILE   = os.path.join(JARVIS_HOME, "gmail_token.json")
 GMAIL_CREDS_FILE   = os.path.join(JARVIS_HOME, "gmail_credentials.json")
 
+# Telegram (free, reliable — replaces flaky WhatsApp Web)
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")  # default destination
+
 # Brain model failover chain — Groq cloud (each model = separate quota)
 # Listed in priority order. Tool-use capable models only.
 GROQ_BRAIN_MODELS = [
@@ -647,14 +651,61 @@ def find_files(pattern: str, root: str = "C:/Users/Dev") -> str:
 # ═══════════════════════════════════════════════════════════════
 #  GENERALIST PRIMITIVE: APP / URI LAUNCHER
 # ═══════════════════════════════════════════════════════════════
+# Microsoft Store / UWP app launch identifiers (use shell:AppsFolder\<AUMID>)
+UWP_APPS = {
+    "whatsapp":   "5319275A.WhatsAppDesktop_cv1g1gvanyjgm!App",
+    "instagram":  "Facebook.InstagramBeta_8xx8rvfyw5nnt!App",
+    "telegram":   "TelegramMessengerLLP.TelegramDesktop_t4vj0pshhgkwm!App",
+    "settings":   "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+    "store":      "Microsoft.WindowsStore_8wekyb3d8bbwe!App",
+    "calculator": "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+    "photos":     "Microsoft.Windows.Photos_8wekyb3d8bbwe!App",
+    "weather":    "Microsoft.BingWeather_8wekyb3d8bbwe!App",
+    "mail":       "microsoft.windowscommunicationsapps_8wekyb3d8bbwe!microsoft.windowslive.mail",
+    "spotify":    "SpotifyAB.SpotifyMusic_zpdnekdrzrea0!Spotify",
+    "xbox":       "Microsoft.GamingApp_8wekyb3d8bbwe!Microsoft.Xbox.App",
+    "edge":       "Microsoft.MicrosoftEdge.Stable_8wekyb3d8bbwe!App",
+    "to do":      "Microsoft.Todos_8wekyb3d8bbwe!App",
+    "todo":       "Microsoft.Todos_8wekyb3d8bbwe!App",
+    "onenote":    "Microsoft.Office.OneNote_8wekyb3d8bbwe!microsoft.onenoteim",
+    "snipping":   "Microsoft.ScreenSketch_8wekyb3d8bbwe!App",
+}
+
+
+def _launch_uwp(aumid: str) -> bool:
+    """Launch a UWP app via its AUMID using explorer.exe shell:AppsFolder\\<aumid>."""
+    try:
+        subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{aumid}"])
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_uwp_aumid(name: str) -> str:
+    """Search Get-StartApps for an installed UWP app matching the name. Slow path."""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-StartApps | Where-Object {{ $_.Name -like '*{name}*' }} "
+             "| Select-Object -First 1 -ExpandProperty AppID"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+
 def open_app_or_path(name_or_path: str, args: str = "") -> str:
-    """Open a known app, an .exe path, a folder, a file, or a URI."""
+    """Open a known app, an .exe path, a folder, a file, a URI, or a UWP / Store app."""
     target = name_or_path.strip()
     target_lower = target.lower()
 
-    # Known app
+    # 1. Known classic app (exe path in APPS dict)
     for app, path in APPS.items():
         if app == target_lower or target_lower in app or app in target_lower:
+            if not os.path.exists(path):
+                continue  # path doesn't exist, try other methods
             try:
                 cmd = [path] + (shlex.split(args) if args else [])
                 subprocess.Popen(cmd)
@@ -662,10 +713,19 @@ def open_app_or_path(name_or_path: str, args: str = "") -> str:
             except FileNotFoundError:
                 continue
 
-    # File / folder / URI
+    # 2. Known UWP / Store app (predefined AUMID)
+    for uwp_name, aumid in UWP_APPS.items():
+        if uwp_name == target_lower or target_lower in uwp_name or uwp_name in target_lower:
+            if _launch_uwp(aumid):
+                return f"Launched {uwp_name} (UWP)."
+
+    # 3. File / folder / URI
     try:
-        if "://" in target or target.startswith("ms-settings:"):
-            os.startfile(target) if not target.startswith("http") else webbrowser.open(target)
+        if "://" in target or target.startswith("ms-settings:") or target.startswith("ms-"):
+            if target.startswith("http"):
+                webbrowser.open(target)
+            else:
+                os.startfile(target)
             return f"Opened {target}."
         if os.path.exists(target):
             if args and target.lower().endswith((".exe", ".bat", ".cmd")):
@@ -673,9 +733,19 @@ def open_app_or_path(name_or_path: str, args: str = "") -> str:
             else:
                 os.startfile(target)
             return f"Opened {target}."
-        # Try executing as command
+    except Exception as e:
+        log(f"  [open_app filesystem path failed: {e}]")
+
+    # 4. Discover UWP via Get-StartApps (catches anything in the Start menu)
+    aumid = _resolve_uwp_aumid(target)
+    if aumid:
+        if _launch_uwp(aumid):
+            return f"Launched {target} (resolved AUMID: {aumid})."
+
+    # 5. Last resort: shell execute
+    try:
         subprocess.Popen(target, shell=True)
-        return f"Started: {target}"
+        return f"Attempted to start: {target}"
     except Exception as e:
         return f"Couldn't open '{target}': {e}"
 
@@ -996,6 +1066,102 @@ def gmail_send(to: str, subject: str, body: str) -> str:
         return f"Email sent to {to}."
     except Exception as e:
         return f"Gmail send error: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  TELEGRAM (free, official, rock-solid)
+# ═══════════════════════════════════════════════════════════════
+TG_API = "https://api.telegram.org/bot{token}/{method}"
+_tg_last_update_id = 0
+
+
+def _telegram_request(method: str, params: dict = None, timeout: int = 15):
+    if not TELEGRAM_BOT_TOKEN:
+        return {"ok": False, "error": "TELEGRAM_BOT_TOKEN not set in .env"}
+    url = TG_API.format(token=TELEGRAM_BOT_TOKEN, method=method)
+    data = urllib.parse.urlencode(params or {}).encode()
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def telegram_send(message: str, chat_id: str = None) -> str:
+    if not TELEGRAM_BOT_TOKEN:
+        return ("Telegram not configured. Add TELEGRAM_BOT_TOKEN to .env. "
+                "Create a bot at @BotFather, get the token. Then send any "
+                "message to your bot and I'll capture your chat_id automatically.")
+    chat_id = chat_id or TELEGRAM_CHAT_ID
+    if not chat_id:
+        # Try to discover chat_id from recent updates
+        upd = _telegram_request("getUpdates", {"limit": 1, "offset": -1})
+        if upd.get("ok") and upd.get("result"):
+            chat_id = str(upd["result"][0].get("message", {}).get("chat", {}).get("id", ""))
+        if not chat_id:
+            return ("No chat_id known. Send any message to your bot first, "
+                    "then I'll auto-discover it.")
+    res = _telegram_request("sendMessage", {"chat_id": chat_id, "text": message,
+                                            "parse_mode": "Markdown"})
+    if res.get("ok"):
+        return f"Telegram message sent to chat {chat_id}."
+    return f"Telegram send failed: {res.get('error') or res.get('description')}"
+
+
+def telegram_read(count: int = 5) -> str:
+    if not TELEGRAM_BOT_TOKEN:
+        return "Telegram not configured."
+    res = _telegram_request("getUpdates", {"limit": count, "offset": -count})
+    if not res.get("ok"):
+        return f"Telegram read failed: {res.get('error') or res.get('description')}"
+    msgs = res.get("result", [])
+    if not msgs:
+        return "No recent messages."
+    lines = []
+    for u in msgs:
+        m = u.get("message") or u.get("edited_message") or {}
+        sender = (m.get("from", {}).get("first_name", "?")
+                  + " " + m.get("from", {}).get("last_name", "")).strip()
+        chat_id = m.get("chat", {}).get("id", "?")
+        text = m.get("text", "(non-text)")
+        lines.append(f"[{chat_id}] {sender}: {text[:140]}")
+    return "\n".join(lines)
+
+
+def telegram_listen_loop():
+    """Background: poll Telegram for new messages, run each as a JARVIS command."""
+    global _tg_last_update_id
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    log("  Telegram listener ........... ONLINE (poll every 4s)")
+    while not shutdown_event.is_set():
+        try:
+            params = {"timeout": 25, "offset": _tg_last_update_id + 1}
+            res = _telegram_request("getUpdates", params, timeout=30)
+            if res.get("ok"):
+                for u in res.get("result", []):
+                    _tg_last_update_id = u["update_id"]
+                    m = u.get("message") or {}
+                    text = m.get("text", "")
+                    chat_id = str(m.get("chat", {}).get("id", ""))
+                    sender = m.get("from", {}).get("first_name", "?")
+                    if not text or not chat_id:
+                        continue
+                    log(f"  [Telegram from {sender}: {text[:60]}]")
+                    hud_event("telegram_in", sender=sender, text=text)
+                    # Auto-respond by treating it as a JARVIS command
+                    if text.startswith("/"):
+                        text = text[1:]
+                    try:
+                        reply = react_loop(text, speak_progress=False)
+                        if reply:
+                            telegram_send(reply, chat_id=chat_id)
+                    except Exception as e:
+                        telegram_send(f"Error: {e}", chat_id=chat_id)
+        except Exception as e:
+            log(f"  [Telegram poll error: {e}]")
+            shutdown_event.wait(10)
 
 # ═══════════════════════════════════════════════════════════════
 #  BROWSER (browser-use for non-Gmail tasks)
@@ -1554,10 +1720,27 @@ TOOLS = [
             "required": ["to", "subject", "body"]}}},
     {"type": "function", "function": {
         "name": "send_whatsapp",
-        "description": "Send a WhatsApp message via WhatsApp Web (browser-use AI navigation).",
+        "description": ("Send a WhatsApp message via WhatsApp Web. UNRELIABLE on free tier — "
+                        "WhatsApp actively fights automation and breaks weekly. PREFER "
+                        "telegram_send if Mr. Stark hasn't specifically required WhatsApp."),
         "parameters": {"type": "object", "properties": {
             "contact": {"type": "string"}, "message": {"type": "string"}},
             "required": ["contact", "message"]}}},
+    {"type": "function", "function": {
+        "name": "telegram_send",
+        "description": ("Send a Telegram message via the official Telegram Bot API. "
+                        "Reliable, free, instant. If chat_id is omitted, uses the default "
+                        "chat configured in .env. PREFER THIS over WhatsApp."),
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "string"},
+            "chat_id": {"type": "string", "description": "Destination chat (optional)"}},
+            "required": ["message"]}}},
+    {"type": "function", "function": {
+        "name": "telegram_read",
+        "description": "Read recent messages received by the Telegram bot.",
+        "parameters": {"type": "object", "properties": {
+            "count": {"type": "integer", "description": "How many to fetch (default 5)"}},
+            "required": []}}},
     {"type": "function", "function": {
         "name": "browser_action",
         "description": ("Run an arbitrary multi-step task in the browser via browser-use AI. "
@@ -1723,6 +1906,8 @@ TOOL_DISPATCH = {
     "take_screenshot": _t_take_screenshot, "analyze_screen": _t_analyze_screen,
     "gmail_read": _t_gmail_read, "gmail_send": _t_gmail_send,
     "send_whatsapp": _t_send_whatsapp, "browser_action": _t_browser_action,
+    "telegram_send": lambda a: telegram_send(a.get("message",""), a.get("chat_id")),
+    "telegram_read": lambda a: telegram_read(int(a.get("count", 5))),
     "get_time": _t_get_time, "get_date": _t_get_date, "get_weather": _t_get_weather,
     "get_news": _t_get_news, "system_status": _t_system_status, "system_control": _t_system_control,
     "briefing": _t_briefing, "schedule_command": _t_schedule_command,
@@ -2112,17 +2297,28 @@ def launch_hud():
         log("  [HUD] hud.py not found.")
         return
     try:
-        # Reset events file so HUD starts fresh
+        # Don't reset the events file — keeps history visible to a re-opened HUD.
+        # Trim if too large.
         try:
-            with open(HUD_EVENTS_FILE, "w") as f:
-                f.write("")
+            if os.path.getsize(HUD_EVENTS_FILE) > 1_000_000:
+                with open(HUD_EVENTS_FILE, "w") as f:
+                    f.write("")
         except Exception:
             pass
+        # Use pythonw.exe (no console) so the HUD runs cleanly under Qt.
+        # NO DETACHED_PROCESS flag — that breaks Qt window registration on Win11.
+        # CREATE_NEW_PROCESS_GROUP makes it survive parent shutdown via os._exit.
+        py_exe = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.exists(py_exe):
+            py_exe = sys.executable
+        hud_log = os.path.join(JARVIS_HOME, "hud_stderr.log")
         hud_process = subprocess.Popen(
-            [sys.executable, hud_path],
-            creationflags=subprocess.DETACHED_PROCESS if hasattr(subprocess, "DETACHED_PROCESS") else 0,
+            [py_exe, hud_path],
+            stdout=open(hud_log, "ab"),
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
         )
-        log("  HUD launched.")
+        log(f"  HUD launched (PID {hud_process.pid}).")
     except Exception as e:
         log(f"  [HUD launch failed: {e}]")
 
@@ -2151,6 +2347,8 @@ def voice_loop():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=proactive_monitor, daemon=True).start()
     threading.Thread(target=clipboard_watcher, daemon=True).start()
+    if TELEGRAM_BOT_TOKEN:
+        threading.Thread(target=telegram_listen_loop, daemon=True).start()
 
     log(f"  Tools registered: {len(TOOLS)} static + {len(_dynamic_specs)} dynamic")
     log(f"  Vision: {'ON' if PIL_AVAILABLE else 'OFF'}")
@@ -2160,9 +2358,34 @@ def voice_loop():
     log(f"  Window control: {'ON' if PYGW_AVAILABLE else 'OFF'}")
     log("  All systems operational.")
 
-    # Auto-launch HUD
+    # Auto-launch HUD (always, before greeting — so user sees it visually)
     if HUD_ENABLED:
         launch_hud()
+        time.sleep(0.8)  # let HUD draw
+
+    # Windows toast — tells user JARVIS is alive even if tray is hidden
+    try:
+        from win11toast import toast
+        threading.Thread(target=lambda: toast(
+            "JARVIS is online",
+            "HUD opened top-right. Say 'Jarvis' to wake. Right-click tray for menu.",
+            duration="short", on_click=lambda _: launch_hud(),
+        ), daemon=True).start()
+    except Exception as e:
+        log(f"  [Toast unavailable: {e}]")
+
+    # Pre-warm the brain so the FIRST user task doesn't see a cold rate-limit
+    def _prewarm():
+        try:
+            log("  Pre-warming brain...")
+            r = call_brain([{"role": "user", "content": "ready"}], temperature=0)
+            if r:
+                log("  Brain pre-warm ............. OK")
+            else:
+                log("  Brain pre-warm ............. FAILED — Ollama will be used")
+        except Exception as e:
+            log(f"  Brain pre-warm error: {e}")
+    threading.Thread(target=_prewarm, daemon=True).start()
 
     speak(greet())
 

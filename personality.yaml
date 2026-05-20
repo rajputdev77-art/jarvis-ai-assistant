@@ -75,6 +75,15 @@ guard_rails:
     - "rm -rf"
     - "del /q"
 
+# Welcome routine — fires when you say "daddy's home", "wake up", "I'm back",
+# "good morning jarvis", "boot up". Plays a song + briefs you.
+welcome:
+  favorite_song: "Iron Man Black Sabbath"   # YouTube auto-search query
+  play_music: true                           # set false to skip music
+  include_weather: true
+  include_tasks: true
+  include_projects: true
+
 # Pet topics — JARVIS will gently nudge if these come up
 nudges:
   late_night_hours: [2, 3, 4]

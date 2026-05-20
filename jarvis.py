@@ -1908,6 +1908,402 @@ def call_dynamic_tool(name: str, args: dict) -> str:
     except Exception as e:
         return f"Dynamic tool '{name}' raised: {e}"
 
+
+# ═══════════════════════════════════════════════════════════════
+#  TASK TRACKER (persistent pending / in-progress / done)
+# ═══════════════════════════════════════════════════════════════
+TASKS_FILE = r"C:\Users\Dev\JARVIS\tasks.json"
+_tasks_lock = threading.Lock()
+
+
+def _load_tasks():
+    try:
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"pending": [], "in_progress": [], "done": []}
+
+
+def _save_tasks(data):
+    try:
+        with open(TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+
+def add_task(text: str, priority: str = "medium") -> str:
+    if not text: return "No task text."
+    with _tasks_lock:
+        data = _load_tasks()
+        data["pending"].append({
+            "id": int(time.time() * 1000) % 1_000_000,
+            "text": text[:200],
+            "priority": priority,
+            "added": datetime.now().isoformat(timespec="seconds"),
+        })
+        _save_tasks(data)
+    return f"Task added: {text[:120]}"
+
+
+def complete_task(text_or_id: str) -> str:
+    with _tasks_lock:
+        data = _load_tasks()
+        target = None
+        try:
+            tid = int(text_or_id)
+            for t in data["pending"] + data["in_progress"]:
+                if t.get("id") == tid: target = t; break
+        except ValueError:
+            tl = text_or_id.lower().strip()
+            for t in data["pending"] + data["in_progress"]:
+                if tl in t["text"].lower(): target = t; break
+        if not target:
+            return f"No matching task: '{text_or_id}'"
+        for lst in ("pending", "in_progress"):
+            if target in data[lst]: data[lst].remove(target)
+        target["completed"] = datetime.now().isoformat(timespec="seconds")
+        data["done"].append(target)
+        _save_tasks(data)
+    return f"Completed: {target['text'][:120]}"
+
+
+def list_tasks(which: str = "pending") -> str:
+    with _tasks_lock:
+        data = _load_tasks()
+    which = (which or "pending").lower()
+    lst = data.get(which, [])
+    if not lst:
+        return f"No {which} tasks."
+    lines = [f"{which.upper()} ({len(lst)}):"]
+    for t in lst[:15]:
+        lines.append(f"  [{t.get('id','?')}] {t['text'][:100]} ({t.get('priority','med')})")
+    if len(lst) > 15:
+        lines.append(f"  ... +{len(lst)-15} more")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  BUILDER — autonomous app builder
+# ═══════════════════════════════════════════════════════════════
+BUILDS_ROOT = r"C:\Users\Dev\Desktop\jarvis-builds"
+_active_builds = {}   # build_id -> {"status", "log", "thread"}
+
+
+def _slugify(text: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9-]+", "-", text.lower()).strip("-")
+    return s[:40] or f"build-{int(time.time())}"
+
+
+def _detect_available_stacks() -> dict:
+    """Detect what build tools are installed."""
+    stacks = {}
+    checks = [
+        ("node", "node --version"),
+        ("npm", "npm --version"),
+        ("python", "python --version"),
+        ("pip", "pip --version"),
+        ("git", "git --version"),
+        ("vite", "npm view vite version"),
+        ("cursor", r"C:\Users\Dev\AppData\Local\Programs\cursor\Cursor.exe"),
+        ("vscode", r"C:\Users\Dev\AppData\Local\Programs\Microsoft VS Code\Code.exe"),
+    ]
+    for name, check in checks:
+        if check.startswith("C:"):
+            stacks[name] = os.path.exists(check)
+        else:
+            try:
+                r = subprocess.run(check.split(), capture_output=True, text=True,
+                                   timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
+                stacks[name] = r.returncode == 0
+            except Exception:
+                stacks[name] = False
+    return stacks
+
+
+def _plan_build(description: str) -> dict:
+    """Ask the brain to produce a build plan as JSON."""
+    stacks = _detect_available_stacks()
+    available = [k for k, v in stacks.items() if v]
+    prompt = (
+        f"You are a software architect. Mr. Stark wants you to build: {description}\n\n"
+        f"Available tools on his Windows machine: {', '.join(available)}\n\n"
+        f"Choose the BEST stack and produce a JSON build plan. The plan must be a single "
+        f"JSON object with these keys:\n"
+        f'  "name": short kebab-case project name\n'
+        f'  "stack": one of [vite-react, next, vite-vanilla, python-cli, python-fastapi, html-static, electron]\n'
+        f'  "summary": one-sentence description of what we will build\n'
+        f'  "scaffold_command": shell command to scaffold the project (run from the parent folder)\n'
+        f'  "files": array of {{"path": "relative/path.ext", "purpose": "what this file does"}} '
+        f'        for the MAIN files we need to write (3-6 files max for v1)\n'
+        f'  "install_command": command to install deps (or empty if scaffold handles it)\n'
+        f'  "run_command": command to launch the dev server / app\n'
+        f'  "expected_url": URL where the app will be reachable (or empty for CLI/scripts)\n\n'
+        f"Return ONLY the JSON, no markdown, no commentary."
+    )
+    resp = call_brain([{"role": "user", "content": prompt}], temperature=0.2)
+    if resp is None:
+        return {"error": "Brain unavailable"}
+    raw = resp.choices[0].message.content or ""
+    # Extract JSON
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return {"error": "No JSON in plan", "raw": raw[:300]}
+    try:
+        return json.loads(m.group(0))
+    except Exception as e:
+        return {"error": f"JSON parse: {e}", "raw": m.group(0)[:300]}
+
+
+def _generate_file_content(project_name: str, file_spec: dict, stack: str,
+                           description: str) -> str:
+    """Use the brain to generate code for a single file."""
+    prompt = (
+        f"You are generating code for a {stack} project named '{project_name}'.\n"
+        f"User wanted: {description}\n\n"
+        f"Generate the COMPLETE contents of the file '{file_spec['path']}' whose purpose is: "
+        f"{file_spec['purpose']}.\n\n"
+        f"Rules:\n"
+        f"- Output ONLY the file contents, no markdown fences, no commentary.\n"
+        f"- Make it work, but keep it minimal — v1 prototype, not production.\n"
+        f"- Use modern idioms for the chosen stack.\n"
+        f"- If a React file, use functional components + hooks.\n"
+        f"- If CSS, modern flexbox/grid.\n"
+        f"- Add brief comments only where logic is non-obvious."
+    )
+    resp = call_brain([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=2000)
+    if resp is None:
+        return f"// brain unavailable for {file_spec['path']}"
+    text = resp.choices[0].message.content or ""
+    # Strip markdown fences if model wrapped them
+    text = re.sub(r"^```[a-z]*\n", "", text)
+    text = re.sub(r"\n```\s*$", "", text)
+    return text
+
+
+def _build_worker(build_id: str, description: str):
+    """Long-running worker that does the actual build. Reports to HUD."""
+    info = _active_builds[build_id]
+    info["status"] = "planning"
+    hud_event("build_progress", build_id=build_id, status="planning",
+              message=f"Planning: {description[:80]}")
+
+    plan = _plan_build(description)
+    if "error" in plan:
+        info["status"] = "failed"
+        info["log"].append(f"Plan failed: {plan['error']}")
+        hud_event("build_progress", build_id=build_id, status="failed",
+                  message=plan["error"])
+        return
+
+    info["plan"] = plan
+    name = plan.get("name") or _slugify(description)
+    project_dir = os.path.join(BUILDS_ROOT, name)
+    os.makedirs(BUILDS_ROOT, exist_ok=True)
+
+    info["status"] = "scaffolding"
+    hud_event("build_progress", build_id=build_id, status="scaffolding",
+              message=f"Scaffolding {plan['stack']} at {project_dir}")
+
+    # Scaffold
+    if plan.get("scaffold_command"):
+        scaffold_cmd = plan["scaffold_command"].replace("PROJECT", name)
+        try:
+            subprocess.run(scaffold_cmd, shell=True, cwd=BUILDS_ROOT,
+                           timeout=180, capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        except Exception as e:
+            info["log"].append(f"Scaffold error: {e}")
+
+    if not os.path.isdir(project_dir):
+        os.makedirs(project_dir, exist_ok=True)
+
+    # Generate files
+    info["status"] = "writing_code"
+    files = plan.get("files", []) or []
+    for i, fspec in enumerate(files[:8]):
+        hud_event("build_progress", build_id=build_id, status="writing_code",
+                  message=f"Writing {fspec['path']} ({i+1}/{len(files)})")
+        content = _generate_file_content(name, fspec, plan.get("stack","?"), description)
+        full = os.path.join(project_dir, fspec["path"])
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        try:
+            with open(full, "w", encoding="utf-8") as f:
+                f.write(content)
+            info["log"].append(f"Wrote {fspec['path']} ({len(content)} chars)")
+        except Exception as e:
+            info["log"].append(f"Write {fspec['path']} failed: {e}")
+
+    # Install
+    if plan.get("install_command"):
+        info["status"] = "installing"
+        hud_event("build_progress", build_id=build_id, status="installing",
+                  message="Installing dependencies")
+        try:
+            subprocess.run(plan["install_command"], shell=True, cwd=project_dir,
+                           timeout=300, capture_output=True,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+            info["log"].append("Install completed")
+        except Exception as e:
+            info["log"].append(f"Install error: {e}")
+
+    # Run
+    info["status"] = "starting"
+    hud_event("build_progress", build_id=build_id, status="starting",
+              message=f"Launching: {plan.get('run_command','')}")
+    proc = None
+    if plan.get("run_command"):
+        try:
+            log_path = os.path.join(project_dir, "_run.log")
+            log_f = open(log_path, "wb")
+            proc = subprocess.Popen(plan["run_command"], shell=True, cwd=project_dir,
+                                    stdout=log_f, stderr=subprocess.STDOUT,
+                                    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            info["pid"] = proc.pid
+        except Exception as e:
+            info["log"].append(f"Run error: {e}")
+
+    # Verify URL
+    expected_url = plan.get("expected_url", "")
+    if expected_url:
+        time.sleep(8)  # let dev server boot
+        try:
+            req = urllib.request.Request(expected_url, headers={"User-Agent": "JARVIS"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                info["log"].append(f"Verified: HTTP {r.status} at {expected_url}")
+                info["url"] = expected_url
+        except Exception as e:
+            info["log"].append(f"URL verify failed: {e}")
+
+    info["status"] = "done"
+    info["project_dir"] = project_dir
+    hud_event("build_progress", build_id=build_id, status="done",
+              message=f"Built: {project_dir}")
+    speak(f"Build complete, sir. {plan.get('summary','')} ready at "
+          f"{expected_url or project_dir}.")
+
+
+def build_app(description: str) -> str:
+    """Kick off an autonomous app build. Returns immediately with a build_id."""
+    if not description:
+        return "Need a description, sir."
+    build_id = f"b{int(time.time()) % 100000}"
+    _active_builds[build_id] = {
+        "status": "queued", "log": [], "description": description,
+        "started": datetime.now().isoformat(timespec="seconds"),
+    }
+    t = threading.Thread(target=_build_worker, args=(build_id, description), daemon=True)
+    t.start()
+    _active_builds[build_id]["thread"] = t
+    return (f"Build {build_id} started in background. I'll continue while you "
+            f"take care of other things. Say 'build status' to check progress.")
+
+
+def build_status(build_id: str = "") -> str:
+    """Return status of a build (or all active builds)."""
+    if not _active_builds:
+        return "No active builds."
+    if build_id and build_id in _active_builds:
+        b = _active_builds[build_id]
+        log_tail = "\n  ".join(b.get("log", [])[-5:])
+        return (f"Build {build_id}: {b['status']}\n"
+                f"  Description: {b['description']}\n"
+                f"  Last 5 log lines:\n  {log_tail}")
+    # Return all
+    lines = []
+    for bid, b in list(_active_builds.items())[-5:]:
+        lines.append(f"  {bid}: {b['status']} — {b['description'][:60]}")
+    return "Active builds:\n" + "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SWARM — N parallel sub-agents on a research task
+# ═══════════════════════════════════════════════════════════════
+def swarm(task: str, n_agents: int = 5) -> str:
+    """Spawn N parallel sub-agents, each given the same task. Merge results."""
+    n_agents = max(2, min(int(n_agents), 10))
+    results = [None] * n_agents
+    def worker(i):
+        try:
+            resp = call_brain(
+                [{"role": "user", "content":
+                  f"You are sub-agent #{i+1} of {n_agents}. "
+                  f"Task: {task}\n\nGive a CONCISE answer (max 3 sentences). "
+                  f"Different agents will tackle the same task; uniqueness is good."}],
+                temperature=0.7,
+            )
+            results[i] = resp.choices[0].message.content.strip() if resp else "(no response)"
+        except Exception as e:
+            results[i] = f"(error: {e})"
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(n_agents)]
+    for t in threads: t.start()
+    for t in threads: t.join(timeout=45)
+    report = [f"SWARM REPORT ({n_agents} agents on: {task[:80]})\n"]
+    for i, r in enumerate(results):
+        report.append(f"#{i+1}: {r or '(timeout)'}\n")
+    return "\n".join(report)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  WELCOME ROUTINE (daddy's home / good morning / I'm back)
+# ═══════════════════════════════════════════════════════════════
+WELCOME_TRIGGERS = ["daddy is home", "daddy's home", "wake up", "i'm back",
+                    "im back", "i am back", "i'm home", "good morning jarvis",
+                    "boot up"]
+
+
+def welcome_briefing() -> str:
+    """Compose a welcome briefing: time, weather, pending tasks, top projects, focus."""
+    parts = []
+    now = datetime.now()
+    parts.append(f"Welcome back, Mr. Stark. It is {now.strftime('%I:%M %p')}.")
+    # Weather
+    try:
+        w = get_weather()
+        if "unavailable" not in w.lower():
+            parts.append(w)
+    except Exception:
+        pass
+    # System
+    parts.append(system_status_summary())
+    # Tasks
+    try:
+        data = _load_tasks()
+        pending = data.get("pending", [])
+        if pending:
+            top = pending[0]
+            parts.append(f"You have {len(pending)} pending task"
+                         f"{'s' if len(pending)!=1 else ''}. "
+                         f"Top of the list: {top['text']}.")
+        else:
+            parts.append("No pending tasks.")
+    except Exception:
+        pass
+    # Projects — most recently modified
+    try:
+        if time.time() - _project_index.get("last_scan", 0) > 600:
+            scan_projects()
+        projs = _project_index.get("projects", [])[:3]
+        if projs:
+            names = ", ".join(p["name"] for p in projs)
+            parts.append(f"Your three most-recently-touched projects: {names}.")
+    except Exception:
+        pass
+    # Recommendation
+    parts.append("Shall we pick up where we left off, or start something new?")
+    return " ".join(parts)
+
+
+def play_welcome_music():
+    """Play a quick welcome song. Picks user's favorite or default."""
+    try:
+        fav = personality_get("welcome", "favorite_song") or "Iron Man Black Sabbath"
+        url = get_youtube_url(fav)
+        webbrowser.open(url)
+        return True
+    except Exception:
+        return False
+
 # ═══════════════════════════════════════════════════════════════
 #  CONFIRMATION (plan-confirm-execute for dangerous actions)
 # ═══════════════════════════════════════════════════════════════
@@ -2346,6 +2742,58 @@ TOOLS = [
         "description": "Force a fresh scan of Mr. Stark's project folders.",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     # ─── Avengers crew dispatch ───
+    # ─── Phase 9: autonomous building + swarm + tasks + welcome ───
+    {"type": "function", "function": {
+        "name": "build_app",
+        "description": ("Autonomously build a working application from a plain-English "
+                        "description. Picks the best stack, scaffolds the project, "
+                        "writes the code, installs dependencies, runs the dev server, "
+                        "verifies it works. Runs in a BACKGROUND thread so Mr. Stark "
+                        "can do other things while it builds. Returns a build_id "
+                        "immediately. Use build_status(build_id) to check progress."),
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string", "description":
+                "What Mr. Stark wants to build (e.g. 'pomodoro timer web app', "
+                "'cli tool that summarizes pdfs', 'Next.js landing page for X')"}},
+            "required": ["description"]}}},
+    {"type": "function", "function": {
+        "name": "build_status",
+        "description": "Check progress of an autonomous build. Pass empty for a list of all.",
+        "parameters": {"type": "object", "properties": {
+            "build_id": {"type": "string"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "swarm",
+        "description": ("Spawn N parallel sub-agents on the same task and merge their "
+                        "answers. Use for research, comparison, brainstorming "
+                        "(e.g. 'compare 5 frameworks for X', '10 marketing angles for Y'). "
+                        "Max 10 agents."),
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string"},
+            "n_agents": {"type": "integer", "description": "2-10 sub-agents"}},
+            "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "add_task",
+        "description": "Add a task to Mr. Stark's pending list.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"},
+            "priority": {"type": "string", "description": "high | medium | low"}},
+            "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "complete_task",
+        "description": "Mark a task as done. Match by ID or partial text.",
+        "parameters": {"type": "object", "properties": {
+            "text_or_id": {"type": "string"}}, "required": ["text_or_id"]}}},
+    {"type": "function", "function": {
+        "name": "list_tasks",
+        "description": "Return Mr. Stark's task list. Filter by 'pending' / 'in_progress' / 'done'.",
+        "parameters": {"type": "object", "properties": {
+            "which": {"type": "string"}}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "welcome_briefing",
+        "description": ("Generate the welcome-home briefing: time, weather, system status, "
+                        "pending tasks, top recent projects. Used for triggers like "
+                        "'daddy is home', 'I'm back', 'wake up'."),
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
     {"type": "function", "function": {
         "name": "translate",
         "description": ("Translate text to/from Indian languages via Sarvam. "
@@ -2489,6 +2937,14 @@ TOOL_DISPATCH = {
     "dispatch_crew":        lambda a: dispatch_crew(a.get("task", "")),
     "translate":            lambda a: sarvam_translate(a.get("text",""), a.get("target_lang","hi-IN")),
     "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
+    # Phase 9
+    "build_app":            lambda a: build_app(a.get("description","")),
+    "build_status":         lambda a: build_status(a.get("build_id","")),
+    "swarm":                lambda a: swarm(a.get("task",""), int(a.get("n_agents",5))),
+    "add_task":             lambda a: add_task(a.get("text",""), a.get("priority","medium")),
+    "complete_task":        lambda a: complete_task(a.get("text_or_id","")),
+    "list_tasks":           lambda a: list_tasks(a.get("which","pending")),
+    "welcome_briefing":     lambda a: welcome_briefing(),
 }
 
 
@@ -2604,6 +3060,16 @@ AGENTS = {
                   "remember_fact"},
         "prompt": ("You are BLACK WIDOW — quick lookups and clipboard. Silent, fast, "
                    "precise. Single-sentence reports."),
+    },
+    "BUILDER": {
+        "specialty": "Software engineering — scaffolding, writing code, dependency management, running dev servers",
+        "tools": {"run_shell", "read_file", "write_file", "list_dir", "find_files",
+                  "open_app", "build_app", "build_status", "http_get",
+                  "verify_file_exists", "verify_url_reachable"},
+        "prompt": ("You are BUILDER — software engineer of the Avengers crew. "
+                   "You scaffold projects, write code, install deps, run dev servers. "
+                   "Pick the right stack for the job. Use build_app for autonomous "
+                   "full-project builds. Always verify what you built actually works."),
     },
 }
 
@@ -3218,6 +3684,13 @@ def voice_loop():
                                      "stop jarvis", "jarvis stop", "silence",
                                      "stop it", "enough"]):
             stop_speech()
+            active_until = time.time() + FOLLOWUP_WINDOW
+            continue
+
+        # WELCOME triggers — play music + briefing
+        if any(t in cmd_l for t in WELCOME_TRIGGERS):
+            threading.Thread(target=play_welcome_music, daemon=True).start()
+            speak(welcome_briefing())
             active_until = time.time() + FOLLOWUP_WINDOW
             continue
 

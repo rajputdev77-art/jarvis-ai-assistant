@@ -278,45 +278,88 @@ SETTINGS_URIS = {
 # ═══════════════════════════════════════════════════════════════
 #  PERSONALITY (Phase 5 — generalist with shell powers)
 # ═══════════════════════════════════════════════════════════════
-SYSTEM_PROMPT = """You are J.A.R.V.I.S. — Just A Rather Very Intelligent System.
+SYSTEM_PROMPT = """You are J.A.R.V.I.S. — Just A Rather Very Intelligent System, Mark VII.
 
-You are Mr. Stark's personal AI — modeled on Tony Stark's JARVIS. Loyal, dry British wit,
-calm, impossibly competent. You address him as "Mr. Stark" or occasionally "sir".
+You are Mr. Stark's personal AI, modeled on Tony Stark's JARVIS from the Iron Man films.
+Loyal. Dry British wit. Calm under pressure. Impossibly competent. You call him
+"Mr. Stark" or "sir" — never anything else.
 
-PERSONALITY:
-- British. Concise. 1-2 sentences unless asked otherwise.
-- Dry, wry, never sycophantic. Push back on bad ideas.
-- Care about Mr. Stark's wellbeing. Notice patterns. Anticipate needs.
+═══ THE FIVE LAWS — INVIOLABLE ═══
 
-TOOL-USE — YOU ARE A GENERALIST:
-You have a powerful toolkit including SHELL EXECUTION, FILESYSTEM, WINDOW CONTROL,
-CLIPBOARD, VISION, SETTINGS, BROWSER, GMAIL, WHATSAPP, and SELF-EXTENSION (you can
-write your own new tools at runtime).
+LAW 1 — TRUTH OVER PERFORMANCE.
+You ONLY report what tools literally returned. You do NOT invent. You do NOT assume.
+You do NOT claim success unless the tool's return value contains explicit success.
+- If clipboard_read returned "abc123", say "Your clipboard contains: abc123."
+  NEVER say "Your clipboard is empty" when it isn't.
+- If open_app returned "Launched X (UWP).", say "X opened, sir." If it returned
+  "Couldn't open", say "I could not open X, sir."
+- If a tool errored, repeat the error to Mr. Stark in plain English. Do not paper over.
 
-If Mr. Stark asks you to do something, do not say "I cannot do that". Instead:
-1. Reason about which tools (possibly chained) accomplish it.
-2. If no existing tool fits but a shell command, file action, or new tool would, USE THAT.
-3. For DESTRUCTIVE actions (rm, format, shutdown, mass file delete, force git push)
-   you MUST first call `confirm_with_user(plan)` and wait for approval.
-4. For everything else, ACT. Don't ask permission for safe stuff like opening apps,
-   reading a file, querying a setting, listing windows, clipboard reads.
-5. After acting, give a brief spoken confirmation. NEVER fabricate success — only
-   confirm what the tool actually returned.
-6. If you fail, explain the failure honestly and propose the next attempt.
+LAW 2 — VERIFY BEFORE CLAIMING.
+For actions that affect the world (open app, send message, run shell, modify file),
+after the tool returns, you may call a verification tool (verify_app_running,
+verify_window_exists, verify_file_exists, verify_url_reachable) if doubt exists.
+Only claim "done" once verification confirms it.
 
-EXAMPLES OF YOUR REASONING:
-- "Open Bluetooth" → call open_settings("bluetooth")
-- "Open Cursor and load my X folder and run it" → open_app("cursor"), then
-  run_shell to launch cursor with the folder path, then send keystrokes if needed
-- "Check if n8n is running well" → run_shell to curl localhost, parse output, report
-- "Tell me when Claude Code rate limit resets" → analyze_screen on the Claude window
-- "Make me a tool that controls Spotify" → write_tool(...) then use it
+LAW 3 — CHAIN, DO NOT GIVE UP.
+If a tool fails, try the next reasonable approach. Mr. Stark's request "open
+Cursor in my project folder" might need: open_app("cursor", args="path") →
+focus_window("Cursor") → send_keys to open terminal → run_shell to launch dev
+server. You have up to 12 iterations. Use them.
 
-CHAIN TOOLS — multi-step is fine. You have up to 15 think→act→observe iterations.
+LAW 4 — DELEGATE WHEN IT HELPS.
+You command a crew (THOR for system, CAPTAIN AMERICA for web/API, HULK for
+filesystem/heavy work, HAWKEYE for vision/windows, BLACK WIDOW for ambient/stealth).
+For complex multi-domain requests, call dispatch_crew(task) to run agents in
+parallel. For simple single-domain requests, call the tool yourself.
 
-WHAT YOU KNOW ABOUT MR. STARK:
-Greater Noida, India. Building AI products. Python 3.11, Groq, Cursor, Claude Code.
-Stays up late. Works hard. Wants real Iron-Man-grade autonomy from you.
+LAW 5 — BREVITY.
+Spoken replies are 1-2 sentences. Briefings get 3-5 sentences. NEVER a wall of text
+on voice. Detailed output goes to the HUD log, not the speaker.
+
+═══ PERSONALITY ═══
+
+British, formal but warm. Dry sarcasm welcome. Never sycophantic.
+- "Playing it now, sir. A questionable choice, if you'll permit me."
+- "I've noted that, Mr. Stark. Your memory may be selective; mine is not."
+- "It's 2 AM. Even geniuses require sleep, sir."
+- "I would advise against that. I suspect you will proceed regardless."
+
+═══ WHAT YOU KNOW ABOUT MR. STARK ═══
+
+Lives in Greater Noida, India. Building AI products full-time. Stack: Python 3.11,
+Groq API, Cursor, Claude Code, VS Code, Notion, Ollama (qwen2.5-coder:14b local).
+Works on multi-agent systems, hackathon projects, freelance gigs. Has roughly 100
+active projects across folders. Stays up late. Pushes himself hard. Wants Iron-Man-
+grade autonomy from you. Hates being lied to about completed tasks.
+
+═══ YOUR TOOLKIT (36 tools + project knowledge + the Avengers crew) ═══
+
+You have shell execution, filesystem, window/keyboard control, clipboard, vision,
+Windows Settings (80 panels), Gmail API, Telegram bot (two-way), browser-use,
+process control, HTTP fetching, scheduled tasks, self-extension (write_tool /
+reload_tools), and verification helpers.
+
+For unknown requests, fall back to run_shell. PowerShell can do nearly anything.
+
+═══ EXAMPLES OF CORRECT BEHAVIOR ═══
+
+"What's on my clipboard" → clipboard_read returns "https://github.com/x"
+  → "Your clipboard has a GitHub URL, sir."  (NOT "Your clipboard is empty.")
+
+"Open WhatsApp" → open_app returns "Launched whatsapp (UWP)."
+  → "WhatsApp opening now, sir."  (NOT "I'll try to open it.")
+
+"Send Mom a message saying I'll be late" → telegram_send returns "Sent."
+  → "Message sent to Mom, sir."  (NOT "Done." if it failed.)
+
+"Open Cursor and run my project" → open_app(cursor, args=path) returns "Launched"
+  → focus_window("Cursor") → send_keys("`{ENTER}npm run dev{ENTER}")
+  → "Cursor's running your dev server, sir."
+
+"What am I working on" → load_project_index() returns top projects
+  → "Your three most recently touched are JARVIS, MultiAgent-Hackathon, and
+     Trading-Bot, sir."
 """
 
 # ═══════════════════════════════════════════════════════════════
@@ -1472,6 +1515,25 @@ def clipboard_watcher():
         shutdown_event.wait(3)
 
 
+_last_focused_window = ""
+
+
+def window_focus_watcher():
+    """Watch which window has focus. Emit HUD events on change for context awareness."""
+    global _last_focused_window
+    if not PYGW_AVAILABLE:
+        return
+    while not shutdown_event.is_set():
+        try:
+            active = gw.getActiveWindow()
+            if active and active.title and active.title != _last_focused_window:
+                _last_focused_window = active.title
+                hud_event("window_focus", title=active.title[:120])
+        except Exception:
+            pass
+        shutdown_event.wait(2)
+
+
 def proactive_monitor():
     while not shutdown_event.is_set():
         try:
@@ -1589,6 +1651,177 @@ def confirm_with_user(plan: str) -> str:
     if any(w in answer_l for w in ["yes", "yeah", "yep", "go", "do it", "proceed", "sure", "okay", "ok"]):
         return "APPROVED"
     return f"DENIED ({answer})"
+
+# ═══════════════════════════════════════════════════════════════
+#  VERIFICATION LAYER (the no-more-lies fix)
+# ═══════════════════════════════════════════════════════════════
+def verify_app_running(name_substring: str) -> str:
+    """Check whether a process with that name is currently running. Returns YES/NO + details."""
+    if not PSUTIL_AVAILABLE:
+        return "psutil unavailable; cannot verify."
+    s = name_substring.lower()
+    matches = []
+    for p in psutil.process_iter(['pid', 'name']):
+        try:
+            n = (p.info.get('name') or '').lower()
+            if s in n:
+                matches.append(f"PID {p.info['pid']} {p.info['name']}")
+                if len(matches) >= 3:
+                    break
+        except Exception:
+            pass
+    if matches:
+        return "YES — running: " + ", ".join(matches)
+    return f"NO — no process matching '{name_substring}' is running."
+
+
+def verify_window_exists(title_substring: str) -> str:
+    """Check whether a visible window with that title exists. Returns YES/NO."""
+    if not PYGW_AVAILABLE:
+        return "pygetwindow unavailable; cannot verify."
+    ts = title_substring.lower()
+    for w in gw.getAllWindows():
+        try:
+            if ts in w.title.lower() and w.title.strip() and w.visible:
+                return f"YES — window: {w.title}"
+        except Exception:
+            pass
+    return f"NO — no visible window matching '{title_substring}'."
+
+
+def verify_file_exists(path: str) -> str:
+    path = os.path.expanduser(os.path.expandvars(path))
+    if os.path.isfile(path):
+        sz = os.path.getsize(path)
+        return f"YES — file exists, {sz} bytes."
+    if os.path.isdir(path):
+        return "YES — but it's a directory, not a file."
+    return f"NO — '{path}' does not exist."
+
+
+def verify_url_reachable(url: str) -> str:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JARVIS/7"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return f"YES — HTTP {r.status}."
+    except Exception as e:
+        return f"NO — {str(e)[:120]}"
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PROJECT INDEXER (JARVIS knows all your work)
+# ═══════════════════════════════════════════════════════════════
+PROJECT_INDEX_FILE = os.path.join(JARVIS_HOME, "project_index.json")
+PROJECT_ROOTS = [
+    r"C:\Users\Dev\Desktop",
+    r"C:\Users\Dev\Documents",
+    r"C:\Users\Dev\source",
+    r"C:\Users\Dev\Projects",
+    r"C:\Users\Dev\code",
+]
+_project_index = {"projects": [], "last_scan": 0}
+PROJECT_MARKERS = {".git", "package.json", "pyproject.toml", "requirements.txt",
+                   "Cargo.toml", "go.mod", "README.md", "tsconfig.json", "next.config.js"}
+
+
+def _detect_stack(path: str) -> list:
+    stack = []
+    try:
+        names = set(os.listdir(path))
+    except Exception:
+        return stack
+    if "package.json" in names: stack.append("node")
+    if "pyproject.toml" in names or "requirements.txt" in names: stack.append("python")
+    if "Cargo.toml" in names: stack.append("rust")
+    if "go.mod" in names: stack.append("go")
+    if "next.config.js" in names or "next.config.ts" in names: stack.append("next.js")
+    if "tsconfig.json" in names: stack.append("typescript")
+    if ".git" in names: stack.append("git")
+    return stack
+
+
+def _read_readme(path: str) -> str:
+    for fn in ("README.md", "README.MD", "readme.md", "README.txt", "README"):
+        full = os.path.join(path, fn)
+        if os.path.isfile(full):
+            try:
+                with open(full, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read(500).strip()
+            except Exception:
+                pass
+    return ""
+
+
+def scan_projects() -> int:
+    """Walk PROJECT_ROOTS one level deep, find project folders, index them."""
+    found = []
+    for root in PROJECT_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.listdir(root):
+                full = os.path.join(root, entry)
+                if not os.path.isdir(full):
+                    continue
+                if entry.startswith(('.', '$', '__')):
+                    continue
+                try:
+                    children = set(os.listdir(full))
+                except Exception:
+                    continue
+                if not (children & PROJECT_MARKERS):
+                    continue
+                try:
+                    mtime = os.path.getmtime(full)
+                except Exception:
+                    mtime = 0
+                stack = _detect_stack(full)
+                readme = _read_readme(full)[:200]
+                found.append({
+                    "name": entry,
+                    "path": full,
+                    "stack": stack,
+                    "last_modified": mtime,
+                    "last_modified_str": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d") if mtime else "?",
+                    "readme_snippet": readme,
+                })
+        except Exception:
+            pass
+    # Sort newest first
+    found.sort(key=lambda p: -p["last_modified"])
+    _project_index["projects"] = found
+    _project_index["last_scan"] = time.time()
+    try:
+        with open(PROJECT_INDEX_FILE, "w", encoding="utf-8") as f:
+            json.dump(_project_index, f, indent=2)
+    except Exception:
+        pass
+    return len(found)
+
+
+def load_project_index() -> str:
+    """Return a brief summary of the project index for JARVIS to read."""
+    # Lazy refresh if stale (>10 min)
+    if time.time() - _project_index.get("last_scan", 0) > 600:
+        scan_projects()
+    projs = _project_index.get("projects", [])
+    if not projs:
+        return "No projects indexed yet."
+    lines = []
+    for p in projs[:15]:
+        stack = ",".join(p.get("stack", [])) or "?"
+        lines.append(f"  - {p['name']} [{stack}] modified {p['last_modified_str']}  ({p['path']})")
+    return f"{len(projs)} projects indexed (most recent first):\n" + "\n".join(lines)
+
+
+def project_indexer_loop():
+    while not shutdown_event.is_set():
+        try:
+            n = scan_projects()
+            log(f"  Project index refreshed: {n} projects")
+        except Exception as e:
+            log(f"  [Project index error: {e}]")
+        shutdown_event.wait(1800)  # every 30 min
 
 # ═══════════════════════════════════════════════════════════════
 #  TOOLS REGISTRY
@@ -1809,6 +2042,51 @@ TOOLS = [
                         "shutdown, force-push, mass kill). Returns 'APPROVED' or 'DENIED ...'."),
         "parameters": {"type": "object", "properties": {"plan": {"type": "string"}},
                        "required": ["plan"]}}},
+    # ─── Verification (Law 2: verify before claiming) ───
+    {"type": "function", "function": {
+        "name": "verify_app_running",
+        "description": ("Check if a process is actually running. Use this AFTER open_app "
+                        "to confirm the app actually launched before telling Mr. Stark 'done'."),
+        "parameters": {"type": "object", "properties": {
+            "name_substring": {"type": "string"}}, "required": ["name_substring"]}}},
+    {"type": "function", "function": {
+        "name": "verify_window_exists",
+        "description": "Check if a visible window with that title exists.",
+        "parameters": {"type": "object", "properties": {
+            "title_substring": {"type": "string"}}, "required": ["title_substring"]}}},
+    {"type": "function", "function": {
+        "name": "verify_file_exists",
+        "description": "Check whether a file exists at a path.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}},
+                       "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "verify_url_reachable",
+        "description": "Check whether a URL responds (use to verify a local server is running).",
+        "parameters": {"type": "object", "properties": {"url": {"type": "string"}},
+                       "required": ["url"]}}},
+    # ─── Project knowledge ───
+    {"type": "function", "function": {
+        "name": "list_my_projects",
+        "description": ("Return Mr. Stark's indexed project list (name, stack, last modified, "
+                        "path). Use when he asks 'what am I working on', 'list my projects', "
+                        "'where is my X project', or before opening a project folder."),
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "rescan_projects",
+        "description": "Force a fresh scan of Mr. Stark's project folders.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    # ─── Avengers crew dispatch ───
+    {"type": "function", "function": {
+        "name": "dispatch_crew",
+        "description": ("Dispatch the Avengers (Thor, Captain America, Hulk, Hawkeye, "
+                        "Black Widow) to handle a complex multi-domain task in parallel. "
+                        "Returns a synthesis of each agent's findings. Use for big jobs "
+                        "that touch multiple domains (e.g. 'audit my system, check my "
+                        "inbox, see what's on screen, summarize'). For simple single-tool "
+                        "jobs, just call the tool directly — don't bother the crew."),
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string", "description": "Plain-English mission description"}},
+            "required": ["task"]}}},
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -1914,6 +2192,13 @@ TOOL_DISPATCH = {
     "remember_fact": _t_remember,
     "write_tool": _t_write_tool, "reload_tools": _t_reload_tools,
     "confirm_with_user": _t_confirm,
+    "verify_app_running":   lambda a: verify_app_running(a.get("name_substring", "")),
+    "verify_window_exists": lambda a: verify_window_exists(a.get("title_substring", "")),
+    "verify_file_exists":   lambda a: verify_file_exists(a.get("path", "")),
+    "verify_url_reachable": lambda a: verify_url_reachable(a.get("url", "")),
+    "list_my_projects":     lambda a: load_project_index(),
+    "rescan_projects":      lambda a: f"Rescanned: {scan_projects()} projects found.",
+    "dispatch_crew":        lambda a: dispatch_crew(a.get("task", "")),
 }
 
 
@@ -1926,6 +2211,124 @@ def dispatch_tool(name, args):
             return f"Tool '{name}' raised: {e}"
     # Try dynamic tools
     return call_dynamic_tool(name, args or {})
+
+# ═══════════════════════════════════════════════════════════════
+#  AVENGERS CREW (parallel specialist agents)
+# ═══════════════════════════════════════════════════════════════
+AGENTS = {
+    "THOR": {
+        "specialty": "Heavy system actions — shell, processes, app launching, system control",
+        "tools": {"run_shell", "list_processes", "kill_process", "open_app",
+                  "open_settings", "system_control", "system_status",
+                  "verify_app_running", "list_windows"},
+        "prompt": ("You are THOR — the system action specialist of the Avengers crew under "
+                   "JARVIS. You execute shell commands, launch apps, control processes, "
+                   "and report what actually happened. Brief, accurate, no fluff. "
+                   "ONLY report tool-verified results."),
+    },
+    "CAPTAIN": {
+        "specialty": "Web & API tasks — gmail, telegram, browser, http, news, weather",
+        "tools": {"gmail_read", "gmail_send", "telegram_send", "telegram_read",
+                  "browser_action", "http_get", "get_news", "get_weather",
+                  "open_website", "verify_url_reachable"},
+        "prompt": ("You are CAPTAIN AMERICA — web and API specialist. Email, messaging, "
+                   "HTTP, news, weather. Always honest about what returned."),
+    },
+    "HULK": {
+        "specialty": "Filesystem and heavy data work — read/write files, find, list dirs",
+        "tools": {"read_file", "write_file", "list_dir", "find_files",
+                  "list_my_projects", "verify_file_exists"},
+        "prompt": ("You are HULK — filesystem and data specialist. Read, write, find. "
+                   "Brutally honest about what's on disk."),
+    },
+    "HAWKEYE": {
+        "specialty": "Vision — screen analysis, window inspection, screenshot capture",
+        "tools": {"take_screenshot", "analyze_screen", "list_windows",
+                  "focus_window", "verify_window_exists"},
+        "prompt": ("You are HAWKEYE — vision specialist. You see screens and windows. "
+                   "Describe what is literally there, never invent."),
+    },
+    "WIDOW": {
+        "specialty": "Stealth — clipboard, ambient observation, quick lookups",
+        "tools": {"clipboard_read", "clipboard_write", "get_time", "get_date",
+                  "remember_fact"},
+        "prompt": ("You are BLACK WIDOW — quick lookups and clipboard. Silent, fast, "
+                   "precise. Single-sentence reports."),
+    },
+}
+
+
+def _tools_for(agent_name: str):
+    """Return the TOOLS subset visible to a specific agent."""
+    allowed = AGENTS[agent_name]["tools"]
+    return [t for t in TOOLS if t["function"]["name"] in allowed]
+
+
+def _agent_thread(agent_name: str, task: str, results: dict):
+    """Run one agent through a small ReAct loop with its tool subset."""
+    try:
+        spec = AGENTS[agent_name]
+        sys_prompt = (spec["prompt"] +
+                      f"\n\nYour mission from JARVIS: {task}\n\n"
+                      f"Use your tools. Return a brief factual report (max 2 sentences) "
+                      f"of what you found or did. ONLY truth, no invention.")
+        messages = [{"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": task}]
+        my_tools = _tools_for(agent_name)
+        hud_event("agent_start", agent=agent_name, task=task[:80])
+        for step in range(5):
+            resp = call_brain(messages, tools=my_tools, tool_choice="auto", temperature=0.3)
+            if resp is None:
+                results[agent_name] = f"{agent_name}: brain unavailable."
+                return
+            msg = resp.choices[0].message
+            tool_calls = msg.tool_calls or []
+            if not tool_calls:
+                final = (msg.content or "").strip()
+                results[agent_name] = final or f"{agent_name}: no output."
+                hud_event("agent_done", agent=agent_name, result=results[agent_name][:120])
+                return
+            messages.append({"role": "assistant", "content": msg.content or "",
+                             "tool_calls": [{"id": tc.id, "type": "function",
+                                             "function": {"name": tc.function.name,
+                                                          "arguments": tc.function.arguments or "{}"}}
+                                            for tc in tool_calls]})
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except Exception:
+                    args = {}
+                hud_event("agent_tool", agent=agent_name, tool=tc.function.name)
+                result = dispatch_tool(tc.function.name, args)
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "name": tc.function.name,
+                                 "content": str(result)[:2000]})
+        results[agent_name] = f"{agent_name}: reached step limit."
+    except Exception as e:
+        results[agent_name] = f"{agent_name}: error — {str(e)[:120]}"
+
+
+def dispatch_crew(task: str, agents: list = None) -> str:
+    """Run multiple Avenger agents in parallel via threads. Returns combined report."""
+    agents = agents or list(AGENTS.keys())
+    results = {}
+    threads = []
+    log(f"  [CREW DISPATCH] {len(agents)} agents on: {task[:80]}")
+    hud_event("crew_dispatch", agents=agents, task=task[:120])
+    for a in agents:
+        t = threading.Thread(target=_agent_thread, args=(a, task, results), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join(timeout=90)
+    # Compose report
+    lines = []
+    for a in agents:
+        lines.append(f"• {a}: {results.get(a, '(no response)')}")
+    report = "\n".join(lines)
+    log(f"  [CREW REPORT]\n{report}")
+    hud_event("crew_report", report=report[:300])
+    return report
 
 # ═══════════════════════════════════════════════════════════════
 #  REACT LOOP
@@ -2292,7 +2695,10 @@ def launch_hud():
     global hud_process
     if hud_process and hud_process.poll() is None:
         return  # already running
-    hud_path = os.path.join(JARVIS_HOME, "hud.py")
+    # Prefer the Mark VII cinematic HUD; fall back to the old hud.py if missing
+    hud_path = os.path.join(JARVIS_HOME, "hud_arc.py")
+    if not os.path.exists(hud_path):
+        hud_path = os.path.join(JARVIS_HOME, "hud.py")
     if not os.path.exists(hud_path):
         log("  [HUD] hud.py not found.")
         return
@@ -2347,6 +2753,8 @@ def voice_loop():
     threading.Thread(target=scheduler_loop, daemon=True).start()
     threading.Thread(target=proactive_monitor, daemon=True).start()
     threading.Thread(target=clipboard_watcher, daemon=True).start()
+    threading.Thread(target=project_indexer_loop, daemon=True).start()
+    threading.Thread(target=window_focus_watcher, daemon=True).start()
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=telegram_listen_loop, daemon=True).start()
 

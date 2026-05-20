@@ -1,7 +1,9 @@
 """
-JARVIS HUD — Mark VII cinematic interface.
-Full-screen frameless overlay summoned by Win+J.
-Hot rod red + gold. ARC reactor. Audio waveform. Live agent grid. Project panel.
+JARVIS HUD — Mark VII (Phase 7.1)
+Two modes:
+  COMPACT  (default) — small floating widget, top-right, draggable, non-blocking.
+  IMMERSIVE          — fullscreen Iron-Man HUD, Win+J to summon, ESC to dismiss.
+Global hotkey: Win+J toggles immersive (works even when HUD is hidden).
 """
 
 import os
@@ -10,235 +12,115 @@ import json
 import math
 import time
 import random
+import threading
 from collections import deque
 from datetime import datetime
 
-from PyQt6.QtCore import (Qt, QTimer, QRectF, QPointF, QPropertyAnimation,
-                          QEasingCurve, pyqtProperty, QPoint)
+from PyQt6.QtCore import (Qt, QTimer, QRectF, QPointF, pyqtSignal,
+                          pyqtSlot, QPoint, QEvent)
 from PyQt6.QtGui import (QPainter, QColor, QBrush, QPen, QFont, QPainterPath,
-                         QLinearGradient, QRadialGradient, QPolygonF, QFontMetrics,
-                         QKeySequence, QShortcut)
+                         QLinearGradient, QRadialGradient, QPolygonF,
+                         QFontMetrics, QKeySequence, QShortcut, QCursor)
 from PyQt6.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout,
-                             QHBoxLayout, QGridLayout, QScrollArea, QPushButton,
-                             QSizePolicy)
+                             QHBoxLayout, QPushButton, QSizePolicy, QMenu)
 
-EVENTS_FILE = r"C:\Users\Dev\JARVIS\hud_events.jsonl"
+EVENTS_FILE  = r"C:\Users\Dev\JARVIS\hud_events.jsonl"
 PROJECT_FILE = r"C:\Users\Dev\JARVIS\project_index.json"
 
-# Iron Man palette
 HOT_ROD_RED = QColor(190, 30, 40)
-GOLD = QColor(255, 195, 60)
-DEEP_BLACK = QColor(8, 10, 14)
-PANEL_BG = QColor(14, 18, 26, 220)
-CYAN = QColor(80, 220, 255)
-WHITE = QColor(235, 240, 250)
-SUBTLE = QColor(140, 150, 170)
+GOLD        = QColor(255, 195, 60)
+PANEL_BG    = QColor(12, 16, 22, 235)
+CYAN        = QColor(80, 220, 255)
+WHITE       = QColor(235, 240, 250)
+SUBTLE      = QColor(140, 150, 170)
+GREEN       = QColor(80, 230, 120)
 
 STATE_COLOURS = {
     "idle":      QColor(120, 130, 145),
-    "listening": QColor(80, 230, 120),
+    "listening": GREEN,
     "thinking":  GOLD,
     "speaking":  CYAN,
     "working":   HOT_ROD_RED,
 }
-
 STATE_LABEL = {
     "idle": "STANDBY", "listening": "LISTENING",
     "thinking": "REASONING", "speaking": "SPEAKING", "working": "EXECUTING",
 }
-
 AGENTS = ["THOR", "CAPTAIN", "HULK", "HAWKEYE", "WIDOW"]
 
 
-# ─── ARC REACTOR — the centerpiece ────────────────────────────────
+# ─── ARC REACTOR ──────────────────────────────────────────────────
 class ArcReactor(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setMinimumSize(280, 280)
+    def __init__(self, size=80):
+        super().__init__()
+        self.setMinimumSize(size, size)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.state = "idle"
         self.phase = 0.0
         self.amplitude = 0.2
-        timer = QTimer(self)
-        timer.timeout.connect(self._tick)
-        timer.start(30)
+        t = QTimer(self); t.timeout.connect(self._tick); t.start(40)
 
     def _tick(self):
         self.phase += 0.05
-        # decay amplitude (so speaking pulses look natural)
-        self.amplitude *= 0.96
-        self.amplitude = max(self.amplitude, 0.18)
+        self.amplitude = max(self.amplitude * 0.96, 0.18)
         self.update()
 
     def set_state(self, state):
         self.state = state
-        if state == "speaking":
-            self.amplitude = 1.0
-        elif state == "listening":
-            self.amplitude = 0.6
-        elif state in ("thinking", "working"):
-            self.amplitude = 0.45
+        if state == "speaking": self.amplitude = 1.0
+        elif state == "listening": self.amplitude = 0.6
+        elif state in ("thinking", "working"): self.amplitude = 0.45
         self.update()
 
-    def pulse(self, strength=0.8):
-        self.amplitude = max(self.amplitude, strength)
+    def pulse(self, s=0.8):
+        self.amplitude = max(self.amplitude, s)
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
         cx, cy = w / 2, h / 2
-        base_r = min(w, h) * 0.38
-
-        # Outer glow (color tracks state)
-        glow_color = STATE_COLOURS.get(self.state, CYAN)
-        for i in range(6, 0, -1):
-            r = base_r + i * 14 * (1 + 0.4 * self.amplitude * math.sin(self.phase))
-            alpha = int(20 + 18 * (6 - i) / 6 * self.amplitude)
-            c = QColor(glow_color); c.setAlpha(alpha)
+        r = min(w, h) * 0.38
+        glow = STATE_COLOURS.get(self.state, CYAN)
+        for i in range(5, 0, -1):
+            rr = r + i * 10 * (1 + 0.4 * self.amplitude * math.sin(self.phase))
+            c = QColor(glow); c.setAlpha(int(18 + 15 * (5 - i) / 5 * self.amplitude))
             p.setBrush(QBrush(c)); p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(QPointF(cx, cy), r, r)
-
-        # Outer ring (Iron Man triangular segments)
-        segments = 9
-        ring_r = base_r * 1.05
-        inner_r = base_r * 0.88
-        for i in range(segments):
-            ang = (i / segments) * 2 * math.pi + self.phase * 0.1
-            ang2 = ((i + 0.7) / segments) * 2 * math.pi + self.phase * 0.1
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        # segmented ring
+        segs = 9
+        for i in range(segs):
+            a1 = (i / segs) * 2 * math.pi + self.phase * 0.1
+            a2 = ((i + 0.7) / segs) * 2 * math.pi + self.phase * 0.1
+            r1 = r * 1.05; r2 = r * 0.88
             poly = QPolygonF([
-                QPointF(cx + ring_r * math.cos(ang), cy + ring_r * math.sin(ang)),
-                QPointF(cx + ring_r * math.cos(ang2), cy + ring_r * math.sin(ang2)),
-                QPointF(cx + inner_r * math.cos(ang2 - 0.05), cy + inner_r * math.sin(ang2 - 0.05)),
-                QPointF(cx + inner_r * math.cos(ang + 0.05), cy + inner_r * math.sin(ang + 0.05)),
+                QPointF(cx + r1 * math.cos(a1), cy + r1 * math.sin(a1)),
+                QPointF(cx + r1 * math.cos(a2), cy + r1 * math.sin(a2)),
+                QPointF(cx + r2 * math.cos(a2 - 0.05), cy + r2 * math.sin(a2 - 0.05)),
+                QPointF(cx + r2 * math.cos(a1 + 0.05), cy + r2 * math.sin(a1 + 0.05)),
             ])
-            c = QColor(glow_color); c.setAlpha(180)
+            c = QColor(glow); c.setAlpha(180)
             p.setBrush(QBrush(c)); p.setPen(QPen(QColor(255, 255, 255, 30), 1))
             p.drawPolygon(poly)
-
-        # Inner ring
+        # gold rings
         p.setPen(QPen(GOLD, 2)); p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), inner_r - 4, inner_r - 4)
-        p.drawEllipse(QPointF(cx, cy), inner_r - 14, inner_r - 14)
-
-        # Core
-        core_r = base_r * 0.42 + 8 * self.amplitude * abs(math.sin(self.phase * 2))
-        grad = QRadialGradient(cx, cy, core_r)
+        p.drawEllipse(QPointF(cx, cy), r * 0.85, r * 0.85)
+        p.drawEllipse(QPointF(cx, cy), r * 0.7, r * 0.7)
+        # core
+        cr = r * 0.42 + 5 * self.amplitude * abs(math.sin(self.phase * 2))
+        grad = QRadialGradient(cx, cy, cr)
         grad.setColorAt(0.0, QColor(255, 255, 255, 240))
-        grad.setColorAt(0.4, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 220))
-        grad.setColorAt(1.0, QColor(glow_color.red(), glow_color.green(), glow_color.blue(), 30))
+        grad.setColorAt(0.4, QColor(glow.red(), glow.green(), glow.blue(), 220))
+        grad.setColorAt(1.0, QColor(glow.red(), glow.green(), glow.blue(), 30))
         p.setBrush(QBrush(grad)); p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), core_r, core_r)
-
-        # State label
-        p.setPen(GOLD)
-        p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        label = STATE_LABEL.get(self.state, self.state.upper())
-        fm = QFontMetrics(p.font())
-        tw = fm.horizontalAdvance(label)
-        p.drawText(int(cx - tw / 2), int(cy + base_r + 28), label)
+        p.drawEllipse(QPointF(cx, cy), cr, cr)
 
 
-# ─── AGENT CARD — one per Avenger ─────────────────────────────────
-class AgentCard(QWidget):
-    def __init__(self, name):
-        super().__init__()
-        self.name = name
-        self.status = "idle"
-        self.last_tool = ""
-        self.last_result = ""
-        self.pulse_level = 0.0
-        self.setMinimumHeight(72)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        timer = QTimer(self); timer.timeout.connect(self._tick); timer.start(60)
-
-    def _tick(self):
-        self.pulse_level *= 0.9
-        self.update()
-
-    def update_status(self, status, tool="", result=""):
-        self.status = status
-        if tool: self.last_tool = tool
-        if result: self.last_result = result
-        self.pulse_level = 1.0
-        self.update()
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(0, 0, self.width(), self.height())
-        # background
-        bg = QColor(20, 25, 35, 200)
-        path = QPainterPath(); path.addRoundedRect(rect, 8, 8)
-        p.fillPath(path, QBrush(bg))
-        # left status bar
-        status_color = HOT_ROD_RED if self.status == "working" else (
-            GOLD if self.status == "thinking" else CYAN if self.status == "done" else SUBTLE)
-        status_color = QColor(status_color)
-        status_color.setAlpha(int(180 + 75 * self.pulse_level))
-        p.setBrush(QBrush(status_color)); p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(QRectF(0, 0, 4, self.height()), 2, 2)
-        # name
-        p.setPen(GOLD); p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        p.drawText(14, 22, self.name)
-        # status text
-        p.setPen(SUBTLE); p.setFont(QFont("Consolas", 8))
-        status_text = self.status.upper()
-        p.drawText(self.width() - 70, 22, status_text)
-        # tool / result
-        p.setPen(WHITE); p.setFont(QFont("Segoe UI", 9))
-        line = self.last_tool[:40] if self.last_tool else "—"
-        p.drawText(14, 42, f"⚙ {line}")
-        if self.last_result:
-            p.setPen(QColor(180, 200, 220))
-            p.setFont(QFont("Segoe UI", 8))
-            res = self.last_result[:60]
-            p.drawText(14, 60, res)
-
-
-# ─── WAVEFORM during speech ───────────────────────────────────────
-class Waveform(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setMinimumHeight(60)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.active = False
-        self.bars = [random.random() * 0.2 for _ in range(48)]
-        timer = QTimer(self); timer.timeout.connect(self._tick); timer.start(60)
-
-    def _tick(self):
-        if self.active:
-            for i in range(len(self.bars)):
-                target = random.random()
-                self.bars[i] = self.bars[i] * 0.6 + target * 0.4
-        else:
-            for i in range(len(self.bars)):
-                self.bars[i] *= 0.9
-        self.update()
-
-    def set_active(self, active):
-        self.active = active
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        bar_w = w / len(self.bars)
-        for i, v in enumerate(self.bars):
-            bar_h = v * (h - 8)
-            x = i * bar_w + 1
-            y = (h - bar_h) / 2
-            grad = QLinearGradient(0, y, 0, y + bar_h)
-            grad.setColorAt(0, GOLD); grad.setColorAt(1, HOT_ROD_RED)
-            p.setBrush(QBrush(grad)); p.setPen(Qt.PenStyle.NoPen)
-            p.drawRoundedRect(QRectF(x, y, bar_w - 2, bar_h), 2, 2)
-
-
-# ─── EVENT STREAM (left column scroll) ────────────────────────────
+# ─── EVENT STREAM ─────────────────────────────────────────────────
 class EventStream(QWidget):
-    def __init__(self):
+    def __init__(self, max_events=18):
         super().__init__()
-        self.events = deque(maxlen=18)
+        self.events = deque(maxlen=max_events)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def add(self, kind, text):
@@ -249,257 +131,305 @@ class EventStream(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        y = h - 12
+        y = h - 8
         for ts, kind, text in reversed(self.events):
             age = time.time() - ts
-            alpha = max(60, int(255 - age * 4))
-            kind_colors = {
-                "user_said":   GOLD,
-                "speak":       CYAN,
-                "tool_call":   HOT_ROD_RED,
-                "tool_result": QColor(80, 220, 140),
-                "shell":       QColor(255, 130, 60),
-                "agent_start": QColor(200, 100, 240),
-                "agent_done":  QColor(120, 220, 180),
-                "window_focus": SUBTLE,
+            alpha = max(70, int(255 - age * 3))
+            kc = {
+                "user_said": GOLD, "speak": CYAN, "tool_call": HOT_ROD_RED,
+                "tool_result": GREEN, "shell": QColor(255, 130, 60),
+                "agent_start": QColor(200, 100, 240), "agent_done": GREEN,
+                "window_focus": SUBTLE, "predictive": QColor(255, 215, 100),
             }
-            kind_labels = {
-                "user_said": "YOU", "speak": "JRV", "tool_call": "TOOL",
-                "tool_result": " ↳ ", "shell": "SH ", "agent_start": "DEP",
-                "agent_done": "RPT", "window_focus": "FOC",
+            kl = {
+                "user_said": "YOU", "speak": "JRV", "tool_call": "TL",
+                "tool_result": " ↳", "shell": "SH", "agent_start": "→",
+                "agent_done": "←", "window_focus": "FW", "predictive": "PRD",
             }
-            c = QColor(kind_colors.get(kind, SUBTLE)); c.setAlpha(alpha)
-            p.setPen(c); p.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            label = kind_labels.get(kind, kind[:4].upper())
-            p.drawText(8, y, label)
+            c = QColor(kc.get(kind, SUBTLE)); c.setAlpha(alpha)
+            p.setPen(c); p.setFont(QFont("Consolas", 7, QFont.Weight.Bold))
+            p.drawText(6, y, kl.get(kind, kind[:3].upper()))
             tc = QColor(WHITE); tc.setAlpha(alpha)
-            p.setPen(tc); p.setFont(QFont("Segoe UI", 9))
+            p.setPen(tc); p.setFont(QFont("Segoe UI", 8))
             fm = QFontMetrics(p.font())
-            clipped = fm.elidedText(text, Qt.TextElideMode.ElideRight, w - 50)
-            p.drawText(38, y, clipped)
-            y -= 22
-            if y < 24: break
+            clip = fm.elidedText(text, Qt.TextElideMode.ElideRight, w - 36)
+            p.drawText(28, y, clip)
+            y -= 18
+            if y < 16: break
 
 
-# ─── PROJECT PANEL ────────────────────────────────────────────────
-class ProjectPanel(QWidget):
+# ─── AGENT MINI ROW ───────────────────────────────────────────────
+class AgentRow(QWidget):
     def __init__(self):
         super().__init__()
-        self.projects = []
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        timer = QTimer(self); timer.timeout.connect(self._refresh); timer.start(30000)
-        self._refresh()
+        self.statuses = {a: "idle" for a in AGENTS}
+        self.setFixedHeight(28)
 
-    def _refresh(self):
-        try:
-            with open(PROJECT_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            self.projects = data.get("projects", [])[:8]
-        except Exception:
-            self.projects = []
+    def update_agent(self, name, status):
+        self.statuses[name] = status
         self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        # header
-        p.setPen(GOLD); p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        p.drawText(12, 22, f"⚡ PROJECTS  ({len(self.projects)} indexed)")
-        # divider
-        p.setPen(QPen(QColor(80, 90, 110, 120), 1))
-        p.drawLine(12, 32, w - 12, 32)
-        # rows
-        y = 52
-        for proj in self.projects:
-            if y > h - 16: break
-            name = proj.get("name", "?")
-            stack = ",".join(proj.get("stack", [])) or "?"
-            mod = proj.get("last_modified_str", "?")
-            p.setPen(WHITE); p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.drawText(12, y, name[:30])
-            p.setPen(SUBTLE); p.setFont(QFont("Consolas", 8))
-            p.drawText(12, y + 14, f"  {stack}  ·  {mod}")
-            y += 38
-
-
-# ─── PARTICLE BACKGROUND ──────────────────────────────────────────
-class ParticleBg(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.particles = []
-        for _ in range(40):
-            self.particles.append({
-                "x": random.random(), "y": random.random(),
-                "vx": (random.random() - 0.5) * 0.001,
-                "vy": (random.random() - 0.5) * 0.001,
-                "r": random.random() * 1.5 + 0.5,
-            })
-        timer = QTimer(self); timer.timeout.connect(self._tick); timer.start(60)
-
-    def _tick(self):
-        for pt in self.particles:
-            pt["x"] += pt["vx"]; pt["y"] += pt["vy"]
-            if pt["x"] < 0 or pt["x"] > 1: pt["vx"] = -pt["vx"]
-            if pt["y"] < 0 or pt["y"] > 1: pt["vy"] = -pt["vy"]
-        self.update()
-
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        # subtle radial vignette
-        grad = QRadialGradient(w / 2, h / 2, max(w, h) / 1.2)
-        grad.setColorAt(0.0, QColor(20, 22, 30, 0))
-        grad.setColorAt(1.0, QColor(0, 0, 0, 180))
-        p.fillRect(self.rect(), QBrush(grad))
-        # particles
-        for pt in self.particles:
-            x = pt["x"] * w; y = pt["y"] * h
-            c = QColor(255, 195, 60, 60)
+        w = self.width()
+        slot = w / len(AGENTS)
+        for i, a in enumerate(AGENTS):
+            x = i * slot + slot / 2
+            stat = self.statuses[a]
+            c = HOT_ROD_RED if stat == "working" else GOLD if stat == "thinking" else GREEN if stat == "done" else SUBTLE
             p.setBrush(QBrush(c)); p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(QPointF(x, y), pt["r"], pt["r"])
+            p.drawEllipse(QPointF(x, 8), 4, 4)
+            p.setPen(SUBTLE); p.setFont(QFont("Consolas", 6, QFont.Weight.Bold))
+            fm = QFontMetrics(p.font())
+            tw = fm.horizontalAdvance(a)
+            p.drawText(int(x - tw / 2), 24, a)
 
 
-# ─── MAIN HUD WINDOW ──────────────────────────────────────────────
-class JarvisHUD(QWidget):
+# ─── COMPACT WIDGET (default mode — top-right, ~300x420) ──────────
+class CompactHUD(QWidget):
+    """Small always-on-top widget that doesn't block the screen."""
+    requestImmersive = pyqtSignal()
+    requestHide      = pyqtSignal()
+    requestQuit      = pyqtSignal()
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("J.A.R.V.I.S. Mark VII")
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool                # no taskbar entry
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(320, 420)
+        self._drag_pos = None
+        self._build()
+        self._position_top_right()
+
+    def _build(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+
+        # Header
+        header = QWidget(); header.setFixedHeight(40)
+        h = QHBoxLayout(header); h.setContentsMargins(12, 6, 6, 6); h.setSpacing(6)
+        self.title = QLabel("J.A.R.V.I.S.")
+        self.title.setStyleSheet(
+            "color:#ffc23c; font-family:'Segoe UI'; font-size:11pt; "
+            "font-weight:bold; letter-spacing:3px;")
+        h.addWidget(self.title)
+        h.addStretch()
+        self.subtitle = QLabel("STANDBY")
+        self.subtitle.setStyleSheet(
+            "color:#be1e28; font-family:Consolas; font-size:7.5pt; letter-spacing:2px;")
+        h.addWidget(self.subtitle)
+        # Expand button
+        self.btn_full = QPushButton("⛶")
+        self.btn_full.setFixedSize(22, 22)
+        self.btn_full.setToolTip("Open fullscreen Mark VII (Win+J)")
+        self.btn_full.setStyleSheet(self._btn_style())
+        self.btn_full.clicked.connect(lambda: self.requestImmersive.emit())
+        h.addWidget(self.btn_full)
+        self.btn_min = QPushButton("—")
+        self.btn_min.setFixedSize(22, 22)
+        self.btn_min.setToolTip("Hide (Win+J to summon)")
+        self.btn_min.setStyleSheet(self._btn_style())
+        self.btn_min.clicked.connect(lambda: self.requestHide.emit())
+        h.addWidget(self.btn_min)
+        outer.addWidget(header)
+
+        # Arc reactor (compact)
+        reactor_wrap = QWidget(); reactor_wrap.setFixedHeight(110)
+        rl = QVBoxLayout(reactor_wrap); rl.setContentsMargins(0, 0, 0, 0)
+        self.reactor = ArcReactor(size=100)
+        rl.addWidget(self.reactor, 0, Qt.AlignmentFlag.AlignCenter)
+        outer.addWidget(reactor_wrap)
+
+        # Agent strip
+        self.agent_row = AgentRow()
+        outer.addWidget(self.agent_row)
+
+        # "Now doing" label
+        self.now_label = QLabel("Awaiting wake word…")
+        self.now_label.setStyleSheet(
+            "color:#c8d0e0; font-family:'Segoe UI'; font-size:8.5pt; "
+            "padding:6px 12px; background-color:#10141c;")
+        self.now_label.setWordWrap(True)
+        self.now_label.setFixedHeight(38)
+        outer.addWidget(self.now_label)
+
+        # Event stream (compact, fills rest)
+        stream_wrap = QWidget()
+        sl = QVBoxLayout(stream_wrap); sl.setContentsMargins(0, 4, 0, 0)
+        self.stream = EventStream(max_events=12)
+        sl.addWidget(self.stream)
+        outer.addWidget(stream_wrap, 1)
+
+        # Footer hint
+        hint = QLabel("Win+J fullscreen · right-click for menu")
+        hint.setStyleSheet("color:#5a6478; font-family:Consolas; font-size:7pt; padding:3px;")
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setFixedHeight(20)
+        outer.addWidget(hint)
+
+    def _btn_style(self):
+        return ("QPushButton {"
+                "background-color:rgba(255,255,255,0.05); color:#c8d0e0;"
+                "border:none; border-radius:4px; font-family:'Segoe UI'; font-size:11pt;"
+                "} QPushButton:hover { background-color:rgba(255,195,60,0.2); color:#fff; }")
+
+    def _position_top_right(self):
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.move(scr.right() - self.width() - 16, scr.top() + 60)
+
+    # Drag
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        elif e.button() == Qt.MouseButton.RightButton:
+            self._show_menu(e.globalPosition().toPoint())
+
+    def mouseMoveEvent(self, e):
+        if self._drag_pos and (e.buttons() & Qt.MouseButton.LeftButton):
+            self.move(e.globalPosition().toPoint() - self._drag_pos)
+
+    def mouseReleaseEvent(self, _):
+        self._drag_pos = None
+
+    def _show_menu(self, pos):
+        m = QMenu(self)
+        m.setStyleSheet("""
+            QMenu { background:#10141c; color:#e6e8ee; border:1px solid #2a3140;
+                    font-family:'Segoe UI'; font-size:9pt; padding:4px; }
+            QMenu::item:selected { background:#1f2735; color:#ffc23c; }
+        """)
+        a_full = m.addAction("Open Fullscreen Mark VII")
+        a_hide = m.addAction("Hide (Win+J to summon)")
+        m.addSeparator()
+        a_quit = m.addAction("Shutdown JARVIS")
+        chosen = m.exec(pos)
+        if chosen == a_full: self.requestImmersive.emit()
+        elif chosen == a_hide: self.requestHide.emit()
+        elif chosen == a_quit: self.requestQuit.emit()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect())
+        path = QPainterPath(); path.addRoundedRect(rect, 12, 12)
+        grad = QLinearGradient(0, 0, 0, self.height())
+        grad.setColorAt(0.0, QColor(16, 20, 28, 235))
+        grad.setColorAt(1.0, QColor(8, 10, 14, 235))
+        p.fillPath(path, QBrush(grad))
+        # Border + accent
+        p.setPen(QPen(QColor(60, 75, 100, 180), 1)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(path)
+        # Left state accent stripe
+        accent = QColor(STATE_COLOURS.get(getattr(self.reactor, 'state', 'idle'), GOLD))
+        accent.setAlpha(200)
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QBrush(accent))
+        p.drawRoundedRect(QRectF(0, 0, 3, self.height()), 1, 1)
+
+    def update_status(self, state):
+        self.reactor.set_state(state)
+        self.subtitle.setText(STATE_LABEL.get(state, state.upper()))
+        self.update()
+
+
+# ─── IMMERSIVE FULLSCREEN (Mark VII) ──────────────────────────────
+class ImmersiveHUD(QWidget):
+    requestExit = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-
-        screen = QApplication.primaryScreen().availableGeometry()
-        self.full_w, self.full_h = screen.width(), screen.height()
-        self.setGeometry(screen)
-        self._fullscreen = True
-
-        self._file_pos = 0
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.full_w, self.full_h = scr.width(), scr.height()
+        self.setGeometry(scr)
         self.current_state = "idle"
+        self._build()
+        # ESC + Win+J + Ctrl+W all dismiss
+        for key in ("Esc", "Meta+J", "Ctrl+W"):
+            try:
+                sc = QShortcut(QKeySequence(key), self)
+                sc.activated.connect(lambda: self.requestExit.emit())
+            except Exception:
+                pass
 
-        self._build_ui()
-
-        # Global hotkey Win+J — toggle visibility
-        try:
-            self.shortcut = QShortcut(QKeySequence("Meta+J"), self)
-            self.shortcut.activated.connect(self.toggle_visible)
-        except Exception:
-            pass
-
-        # ESC to hide
-        try:
-            esc = QShortcut(QKeySequence("Esc"), self)
-            esc.activated.connect(self.hide)
-        except Exception:
-            pass
-
-        # Poll events
-        timer = QTimer(self); timer.timeout.connect(self._poll); timer.start(120)
-
-        # Show
-        self.show()
-
-    def _build_ui(self):
-        # Background layer
-        self.bg = ParticleBg()
-        self.bg.setParent(self)
-        self.bg.setGeometry(0, 0, self.full_w, self.full_h)
-
-        # Top header overlay
-        self.header = QWidget(self)
-        self.header.setGeometry(0, 0, self.full_w, 48)
-        h_layout = QHBoxLayout(self.header); h_layout.setContentsMargins(28, 8, 28, 8)
-        self.title_label = QLabel("J.A.R.V.I.S.")
-        self.title_label.setStyleSheet(
-            "color: #ffc23c; font-family: 'Segoe UI'; font-size: 16pt; "
-            "font-weight: bold; letter-spacing: 6px;")
-        h_layout.addWidget(self.title_label)
-        h_layout.addStretch()
-        self.subtitle_label = QLabel("MARK VII  ·  STANDBY")
-        self.subtitle_label.setStyleSheet(
-            "color: #be1e28; font-family: Consolas; font-size: 9pt; letter-spacing: 3px;")
-        h_layout.addWidget(self.subtitle_label)
-        h_layout.addStretch()
-        self.time_label = QLabel("")
-        self.time_label.setStyleSheet(
-            "color: #ebf0fa; font-family: Consolas; font-size: 11pt;")
-        h_layout.addWidget(self.time_label)
-        # update clock
-        clk = QTimer(self); clk.timeout.connect(self._update_clock); clk.start(1000)
-        self._update_clock()
-
-        # Hint footer
-        self.hint = QLabel("Win+J to toggle  ·  ESC to hide  ·  drag to move (when windowed)", self)
-        self.hint.setStyleSheet(
-            "color: #6a7388; font-family: Consolas; font-size: 8pt; padding: 6px;")
-        self.hint.setGeometry(0, self.full_h - 28, self.full_w, 28)
-        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # Center: ARC reactor
-        self.reactor = ArcReactor(self)
+    def _build(self):
+        self.reactor = ArcReactor(size=320); self.reactor.setParent(self)
         rsize = 360
         self.reactor.setGeometry(
             int((self.full_w - rsize) / 2),
-            int((self.full_h - rsize) / 2) - 20,
-            rsize, rsize,
-        )
+            int((self.full_h - rsize) / 2) - 30, rsize, rsize)
 
-        # Left column: event stream
-        self.event_stream = EventStream()
-        self.event_stream.setParent(self)
-        self.event_stream.setGeometry(28, 80, 360, self.full_h - 160)
+        self.title = QLabel("J.A.R.V.I.S.", self)
+        self.title.setStyleSheet(
+            "color:#ffc23c; font-family:'Segoe UI'; font-size:18pt; "
+            "font-weight:bold; letter-spacing:8px; background:transparent;")
+        self.title.setGeometry(40, 18, 400, 36)
 
-        # Right column: agent grid + project panel
-        right_w = 380
-        right_x = self.full_w - right_w - 28
+        self.subtitle = QLabel("MARK VII  ·  STANDBY", self)
+        self.subtitle.setStyleSheet(
+            "color:#be1e28; font-family:Consolas; font-size:10pt; "
+            "letter-spacing:4px; background:transparent;")
+        self.subtitle.setGeometry(self.full_w - 350, 28, 320, 22)
+        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignRight)
 
-        agent_panel = QWidget(self)
-        agent_panel.setGeometry(right_x, 80, right_w, 5 * 80 + 16)
-        agent_layout = QVBoxLayout(agent_panel)
-        agent_layout.setContentsMargins(0, 0, 0, 0); agent_layout.setSpacing(6)
-        self.agent_cards = {}
-        for a in AGENTS:
-            card = AgentCard(a)
-            self.agent_cards[a] = card
-            agent_layout.addWidget(card)
+        # CLEAR exit hint + button
+        self.exit_hint = QLabel("ESC to exit  ·  Win+J to toggle", self)
+        self.exit_hint.setStyleSheet(
+            "color:#ffc23c; font-family:Consolas; font-size:10pt; background:transparent;")
+        self.exit_hint.setGeometry(self.full_w - 350, 56, 320, 18)
+        self.exit_hint.setAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # Project panel below agents
-        self.project_panel = ProjectPanel()
-        self.project_panel.setParent(self)
-        proj_y = 80 + (5 * 80 + 16) + 12
-        self.project_panel.setGeometry(right_x, proj_y, right_w,
-                                       self.full_h - proj_y - 60)
+        self.close_btn = QPushButton("✕  EXIT", self)
+        self.close_btn.setGeometry(self.full_w - 110, 80, 90, 32)
+        self.close_btn.setStyleSheet("""
+            QPushButton { background-color:#be1e28; color:#fff; border:1px solid #ffc23c;
+                          font-family:'Segoe UI'; font-size:9pt; font-weight:bold;
+                          letter-spacing:2px; border-radius:4px; }
+            QPushButton:hover { background-color:#ffc23c; color:#0c0e14; }
+        """)
+        self.close_btn.clicked.connect(lambda: self.requestExit.emit())
 
-        # Bottom waveform
-        self.waveform = Waveform()
-        self.waveform.setParent(self)
-        wf_w = 600
-        self.waveform.setGeometry(
-            int((self.full_w - wf_w) / 2), self.full_h - 110, wf_w, 70)
+        # Event stream left
+        self.stream = EventStream(max_events=22)
+        self.stream.setParent(self)
+        self.stream.setGeometry(40, 140, 400, self.full_h - 220)
+
+        # Project panel right
+        self.project_panel = ProjectPanel(); self.project_panel.setParent(self)
+        self.project_panel.setGeometry(self.full_w - 420, 140, 380, self.full_h - 220)
+
+        self.clock = QLabel("", self)
+        self.clock.setStyleSheet(
+            "color:#ebf0fa; font-family:Consolas; font-size:11pt; background:transparent;")
+        self.clock.setGeometry(40, 56, 400, 22)
+        t = QTimer(self); t.timeout.connect(self._update_clock); t.start(1000)
+        self._update_clock()
 
     def _update_clock(self):
-        self.time_label.setText(datetime.now().strftime("%H:%M:%S  ·  %a %d %b"))
+        self.clock.setText(datetime.now().strftime("%H:%M:%S  ·  %A %d %B"))
 
-    def toggle_visible(self):
-        if self.isVisible():
-            self.hide()
-        else:
-            self.show()
-            self.raise_()
-            self.activateWindow()
+    def update_status(self, state):
+        self.current_state = state
+        self.reactor.set_state(state)
+        self.subtitle.setText(f"MARK VII  ·  {STATE_LABEL.get(state, state.upper())}")
+        self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Dark background
-        p.fillRect(self.rect(), QColor(8, 10, 14, 230))
-        # Red horizontal lines top/bottom
+        p.fillRect(self.rect(), QColor(8, 10, 14, 245))
+        # Horizontal lines
         p.setPen(QPen(HOT_ROD_RED, 2))
-        p.drawLine(0, 56, self.full_w, 56)
+        p.drawLine(0, 118, self.full_w, 118)
         p.drawLine(0, self.full_h - 36, self.full_w, self.full_h - 36)
         # Gold corner brackets
         p.setPen(QPen(GOLD, 2))
@@ -510,14 +440,129 @@ class JarvisHUD(QWidget):
             p.drawLine(cx, cy, cx + 24 * sx, cy)
             p.drawLine(cx, cy, cx, cy + 24 * sy)
 
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.requestExit.emit()
+        else:
+            super().keyPressEvent(e)
+
+
+# ─── PROJECT PANEL ────────────────────────────────────────────────
+class ProjectPanel(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.projects = []
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        t = QTimer(self); t.timeout.connect(self._refresh); t.start(30000)
+        self._refresh()
+
+    def _refresh(self):
+        try:
+            with open(PROJECT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.projects = data.get("projects", [])[:10]
+        except Exception:
+            self.projects = []
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(GOLD); p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        p.drawText(8, 22, f"⚡ PROJECTS  ({len(self.projects)})")
+        p.setPen(QPen(QColor(80, 90, 110, 120), 1)); p.drawLine(8, 32, w - 8, 32)
+        y = 52
+        for proj in self.projects:
+            if y > h - 16: break
+            name = proj.get("name", "?")
+            stack = ",".join(proj.get("stack", [])) or "?"
+            mod = proj.get("last_modified_str", "?")
+            p.setPen(WHITE); p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+            p.drawText(8, y, name[:36])
+            p.setPen(SUBTLE); p.setFont(QFont("Consolas", 8))
+            p.drawText(8, y + 14, f"  {stack}  ·  {mod}")
+            y += 36
+
+
+# ─── CONTROLLER (manages compact + immersive + hotkey + event polling) ──
+class HudController:
+    def __init__(self):
+        self.compact = CompactHUD()
+        self.immersive = None  # lazy
+        self.events_pos = 0
+
+        self.compact.requestImmersive.connect(self.show_immersive)
+        self.compact.requestHide.connect(self.hide_all)
+        self.compact.requestQuit.connect(self._quit_jarvis)
+
+        # Poll events file
+        self.timer = QTimer()
+        self.timer.timeout.connect(self._poll)
+        self.timer.start(150)
+
+        # Global Win+J via keyboard library, on a worker thread
+        try:
+            import keyboard
+            keyboard.add_hotkey("windows+j", self._toggle_via_hotkey)
+        except Exception as e:
+            print(f"[HUD] global hotkey unavailable: {e}", flush=True)
+
+        # Show compact on launch
+        self.compact.show()
+
+    def _toggle_via_hotkey(self):
+        """Called from keyboard library's thread — marshal to Qt main thread."""
+        QTimer.singleShot(0, self._toggle_state)
+
+    def _toggle_state(self):
+        if self.immersive and self.immersive.isVisible():
+            self.hide_immersive()
+        elif self.compact.isVisible():
+            self.show_immersive()
+        else:
+            self.compact.show()
+            self.compact.raise_()
+
+    def show_immersive(self):
+        if self.immersive is None:
+            self.immersive = ImmersiveHUD()
+            self.immersive.requestExit.connect(self.hide_immersive)
+        self.compact.hide()
+        self.immersive.show()
+        self.immersive.raise_()
+        self.immersive.activateWindow()
+        # Sync current state
+        self.immersive.update_status(self.compact.reactor.state)
+
+    def hide_immersive(self):
+        if self.immersive:
+            self.immersive.hide()
+        self.compact.show()
+        self.compact.raise_()
+
+    def hide_all(self):
+        self.compact.hide()
+        if self.immersive:
+            self.immersive.hide()
+
+    def _quit_jarvis(self):
+        # Tell jarvis.py to shut down by writing a sentinel file
+        try:
+            with open(r"C:\Users\Dev\JARVIS\.shutdown", "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        QApplication.quit()
+
     def _poll(self):
         if not os.path.exists(EVENTS_FILE):
             return
         try:
             with open(EVENTS_FILE, "r", encoding="utf-8") as f:
-                f.seek(self._file_pos)
+                f.seek(self.events_pos)
                 new = f.read()
-                self._file_pos = f.tell()
+                self.events_pos = f.tell()
             for line in new.splitlines():
                 line = line.strip()
                 if not line: continue
@@ -529,69 +574,67 @@ class JarvisHUD(QWidget):
 
     def _handle(self, evt):
         kind = evt.get("kind", "")
+        targets = [self.compact]
+        if self.immersive and self.immersive.isVisible():
+            targets.append(self.immersive)
+
         if kind == "status":
             state = evt.get("state", "idle")
-            self.current_state = state
-            self.reactor.set_state(state)
-            self.subtitle_label.setText(f"MARK VII  ·  {STATE_LABEL.get(state, state.upper())}")
-            self.waveform.set_active(state == "speaking")
-            return
-        if kind == "user_said":
-            self.event_stream.add("user_said", evt.get("text", ""))
-            self.reactor.pulse(0.5)
-            return
-        if kind == "speak":
-            self.event_stream.add("speak", evt.get("text", ""))
-            self.reactor.pulse(0.9)
-            return
-        if kind == "tool_call":
-            name = evt.get("name", "")
-            args = json.dumps(evt.get("args", {}), ensure_ascii=False)[:60]
-            self.event_stream.add("tool_call", f"{name}({args})")
-            return
-        if kind == "tool_result":
-            self.event_stream.add("tool_result", f"{evt.get('name','')} → {evt.get('result','')[:80]}")
-            return
-        if kind == "shell":
-            self.event_stream.add("shell", evt.get("command", "")[:120])
-            return
-        if kind == "window_focus":
-            self.event_stream.add("window_focus", evt.get("title", "")[:80])
-            return
-        if kind == "agent_start":
-            a = evt.get("agent", "")
-            if a in self.agent_cards:
-                self.agent_cards[a].update_status("working", tool=evt.get("task", "")[:50])
-            self.event_stream.add("agent_start", f"{a}: {evt.get('task','')[:60]}")
-            return
-        if kind == "agent_tool":
-            a = evt.get("agent", "")
-            if a in self.agent_cards:
-                self.agent_cards[a].update_status("working", tool=evt.get("tool", ""))
-            return
-        if kind == "agent_done":
-            a = evt.get("agent", "")
-            if a in self.agent_cards:
-                self.agent_cards[a].update_status("done", result=evt.get("result", "")[:80])
-            self.event_stream.add("agent_done", f"{a}: {evt.get('result','')[:80]}")
-            return
-        if kind == "crew_dispatch":
-            self.event_stream.add("agent_start", f"CREW: {evt.get('task','')[:80]}")
-            return
-        if kind == "crew_report":
-            self.event_stream.add("agent_done", f"REPORT: {evt.get('report','')[:80]}")
+            for t in targets:
+                if hasattr(t, "update_status"):
+                    t.update_status(state)
             return
 
-    def closeEvent(self, e):
-        # Don't actually close — hide instead so global hotkey can bring it back
-        e.ignore()
-        self.hide()
+        # Map event to display
+        if kind == "user_said":
+            text = evt.get("text", "")
+            self.compact.now_label.setText(f"You: \"{text[:80]}\"")
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("user_said", text)
+            self.compact.reactor.pulse(0.5)
+        elif kind == "speak":
+            text = evt.get("text", "")
+            self.compact.now_label.setText(f"JARVIS: \"{text[:80]}\"")
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("speak", text)
+            self.compact.reactor.pulse(0.9)
+        elif kind == "tool_call":
+            name = evt.get("name", "")
+            args = json.dumps(evt.get("args", {}), ensure_ascii=False)[:50]
+            self.compact.now_label.setText(f"→ {name}({args})")
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("tool_call", f"{name}({args})")
+        elif kind == "tool_result":
+            for t in targets:
+                if hasattr(t, "stream"):
+                    t.stream.add("tool_result", f"{evt.get('name','')}: {evt.get('result','')[:80]}")
+        elif kind == "shell":
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("shell", evt.get("command", "")[:100])
+        elif kind == "window_focus":
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("window_focus", evt.get("title", "")[:80])
+        elif kind == "agent_start":
+            a = evt.get("agent", "")
+            self.compact.agent_row.update_agent(a, "working")
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("agent_start", f"{a}: {evt.get('task','')[:60]}")
+        elif kind == "agent_done":
+            a = evt.get("agent", "")
+            self.compact.agent_row.update_agent(a, "done")
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("agent_done", f"{a}: {evt.get('result','')[:80]}")
+        elif kind == "predictive":
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("predictive", evt.get("text", "")[:140])
+        elif kind == "shutdown":
+            QApplication.quit()
 
 
 def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-    hud = JarvisHUD()
+    ctrl = HudController()
     sys.exit(app.exec())
 
 

@@ -1534,6 +1534,110 @@ def window_focus_watcher():
         shutdown_event.wait(2)
 
 
+_predictive_observations = deque(maxlen=10)
+_predictive_active = True
+PREDICTIVE_INTERVAL = 300   # 5 minutes between checks
+
+
+def predictive_observer():
+    """
+    Every PREDICTIVE_INTERVAL seconds, capture screen and ask vision model
+    whether anything is actionable. If yes, JARVIS speaks up briefly.
+    Skips during active voice interaction (active_until in the future).
+    """
+    if not PIL_AVAILABLE:
+        log("  Predictive observer ......... OFF (Pillow missing)")
+        return
+    log("  Predictive observer ......... ONLINE (check every 5 min)")
+    # Wait a bit before first observation so startup doesn't trigger it
+    shutdown_event.wait(60)
+    while not shutdown_event.is_set():
+        try:
+            # Don't observe during active conversation
+            if time.time() < active_until + 8:
+                shutdown_event.wait(15)
+                continue
+            # Skip if TRAY_STATE is busy (speaking/working/listening)
+            if TRAY_STATE in ("speaking", "listening", "working"):
+                shutdown_event.wait(15)
+                continue
+
+            try:
+                b64 = _capture_screen_b64(max_dim=900)
+            except Exception:
+                shutdown_event.wait(PREDICTIVE_INTERVAL)
+                continue
+
+            prompt = (
+                "You are JARVIS observing Mr. Stark's screen passively. "
+                "Look at this screenshot. Is there anything ACTIONABLE or "
+                "NOTEWORTHY worth interrupting him about? "
+                "Examples worth speaking up about: visible error message, "
+                "build failure, payment screen left open, calendar reminder, "
+                "low battery warning, a question he asked Claude/ChatGPT that "
+                "is sitting unanswered, an obvious typo in code. "
+                "Examples NOT worth speaking: normal coding, browsing, watching "
+                "video, ordinary work. "
+                "Reply in one of two ways: "
+                "1) If something noteworthy: a SINGLE concise sentence (under 18 words) "
+                "   in JARVIS's voice that Mr. Stark would want to hear, starting with 'Sir,' or 'Mr. Stark,'. "
+                "2) Otherwise reply exactly: NOTHING."
+            )
+
+            try:
+                r = client.chat.completions.create(
+                    model=VISION_MODELS[0] if 'VISION_MODELS' in globals() else VISION_MODEL,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url",
+                             "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        ],
+                    }],
+                    max_tokens=80, temperature=0.3,
+                )
+                reply = r.choices[0].message.content.strip()
+            except Exception as e:
+                log(f"  [Predictive vision error: {str(e)[:120]}]")
+                shutdown_event.wait(PREDICTIVE_INTERVAL)
+                continue
+
+            # Store observation regardless of speech
+            _predictive_observations.append({
+                "t": time.time(), "text": reply[:200],
+            })
+
+            # Speak only if something noteworthy AND not during active session
+            up = reply.upper().strip()
+            if up != "NOTHING" and "NOTHING" not in up[:15] and len(reply) > 5:
+                if time.time() >= active_until + 8 and TRAY_STATE == "idle":
+                    log(f"  [Predictive observation: {reply[:120]}]")
+                    hud_event("predictive", text=reply[:200])
+                    speak(reply)
+        except Exception as e:
+            log(f"  [Predictive observer error: {e}]")
+        shutdown_event.wait(PREDICTIVE_INTERVAL)
+
+
+def shutdown_sentinel_watcher():
+    """Watch for the .shutdown sentinel file (written by HUD's Quit button)."""
+    sentinel = os.path.join(JARVIS_HOME, ".shutdown")
+    while not shutdown_event.is_set():
+        try:
+            if os.path.exists(sentinel):
+                log("  [Shutdown sentinel detected]")
+                try: os.remove(sentinel)
+                except Exception: pass
+                hud_event("shutdown")
+                shutdown_event.set()
+                speak("Powering down. Until next time, sir.")
+                os._exit(0)
+        except Exception:
+            pass
+        shutdown_event.wait(2)
+
+
 def proactive_monitor():
     while not shutdown_event.is_set():
         try:
@@ -2755,6 +2859,8 @@ def voice_loop():
     threading.Thread(target=clipboard_watcher, daemon=True).start()
     threading.Thread(target=project_indexer_loop, daemon=True).start()
     threading.Thread(target=window_focus_watcher, daemon=True).start()
+    threading.Thread(target=predictive_observer, daemon=True).start()
+    threading.Thread(target=shutdown_sentinel_watcher, daemon=True).start()
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=telegram_listen_loop, daemon=True).start()
 

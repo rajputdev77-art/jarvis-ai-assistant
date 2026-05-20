@@ -98,6 +98,88 @@ SARVAM_API_KEY   = os.environ.get("SARVAM_API_KEY", "")
 VOICE_PROVIDER   = os.environ.get("VOICE_PROVIDER", "edge").lower()  # edge | sarvam
 SARVAM_TTS_VOICE = os.environ.get("SARVAM_TTS_VOICE", "meera")       # meera/maitreyi/etc.
 SARVAM_LANG      = os.environ.get("SARVAM_LANG", "en-IN")            # hi-IN, ta-IN, etc.
+
+# ── Personality config (user-editable YAML — hot-reloaded) ─────
+PERSONALITY_FILE = r"C:\Users\Dev\JARVIS\personality.yaml"
+_personality = {}
+_personality_mtime = 0
+
+
+def load_personality():
+    """Load personality.yaml. Reloads automatically if file changed."""
+    global _personality, _personality_mtime, VOICE, VOICE_PROVIDER, FOLLOWUP_WINDOW, REACT_MAX_ITER
+    if not os.path.exists(PERSONALITY_FILE):
+        return
+    try:
+        mtime = os.path.getmtime(PERSONALITY_FILE)
+        if mtime == _personality_mtime:
+            return  # no change
+        _personality_mtime = mtime
+        try:
+            import yaml
+        except ImportError:
+            return
+        with open(PERSONALITY_FILE, "r", encoding="utf-8") as f:
+            _personality = yaml.safe_load(f) or {}
+        # Apply live-tweakable settings
+        voice_cfg = _personality.get("voice", {})
+        if voice_cfg.get("provider"):
+            VOICE_PROVIDER = voice_cfg["provider"].lower()
+        if voice_cfg.get("edge_voice"):
+            VOICE = voice_cfg["edge_voice"]
+        beh = _personality.get("behavior", {})
+        if beh.get("follow_up_window"):
+            FOLLOWUP_WINDOW = int(beh["follow_up_window"])
+        if beh.get("react_max_iter"):
+            REACT_MAX_ITER = int(beh["react_max_iter"])
+    except Exception as e:
+        try: log(f"  [personality.yaml parse error: {e}]")
+        except Exception: pass
+
+
+def personality_get(*keys, default=None):
+    """Helper: personality_get('responses', 'greeting_morning')"""
+    cur = _personality
+    for k in keys:
+        if not isinstance(cur, dict): return default
+        cur = cur.get(k)
+        if cur is None: return default
+    return cur
+
+
+def personality_watcher_loop():
+    """Re-reads personality.yaml every 5 seconds so edits take effect live."""
+    while not shutdown_event.is_set():
+        load_personality()
+        shutdown_event.wait(5)
+
+
+def check_custom_command(text: str):
+    """Returns (reply, action_run) if text matches a custom_commands trigger, else None."""
+    cmds = personality_get("custom_commands", default=[]) or []
+    tl = text.lower().strip()
+    for cmd in cmds:
+        trig = (cmd.get("trigger") or "").lower().strip()
+        if not trig: continue
+        if trig in tl or tl in trig:
+            action = (cmd.get("action") or "").lower()
+            args = cmd.get("args", "")
+            reply = cmd.get("reply", "Done, sir.")
+            try:
+                if action == "shell":
+                    run_shell(args)
+                elif action == "open":
+                    open_app_or_path(args)
+                elif action == "say":
+                    pass  # reply will be spoken
+                return reply
+            except Exception as e:
+                return f"Couldn't run that custom command, sir: {e}"
+    return None
+
+
+# Load on import
+load_personality()
 WAKE_WORD        = "jarvis"
 JARVIS_HOME      = r"C:\Users\Dev\JARVIS"
 BROWSER_DATA_DIR = os.path.join(JARVIS_HOME, "browser_data")
@@ -2872,10 +2954,16 @@ def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
 # ═══════════════════════════════════════════════════════════════
 def greet():
     h = datetime.now().hour
-    period = "Good morning" if h < 12 else "Good afternoon" if h < 17 else "Good evening"
-    pct, _ = get_battery()
-    bat = f" Battery at {pct}%." if pct and pct <= 100 else ""
-    return f"{period}, Mr. Stark. All systems are online.{bat} Say my name when you need me."
+    if h < 12:
+        custom = personality_get("responses", "greeting_morning")
+        fallback = "Good morning, Mr. Stark. All systems online."
+    elif h < 17:
+        custom = personality_get("responses", "greeting_afternoon")
+        fallback = "Good afternoon, Mr. Stark. At your service."
+    else:
+        custom = personality_get("responses", "greeting_evening")
+        fallback = "Good evening, Mr. Stark. Ready when you are."
+    return custom or fallback
 
 # ═══════════════════════════════════════════════════════════════
 #  TRAY
@@ -2937,7 +3025,24 @@ def _tray_shutdown(_=None, __=None):
 
 
 def _tray_show_hud(_=None, __=None):
+    """Tell the HUD process to show its compact window via the HUD-show sentinel."""
+    sentinel = os.path.join(JARVIS_HOME, ".hud_show")
+    try:
+        with open(sentinel, "w") as f: f.write(str(time.time()))
+    except Exception: pass
+    # Also (re)launch HUD if not running
     launch_hud()
+
+
+def stop_speech(_=None, __=None):
+    """INTERRUPT — stop JARVIS mid-speech. Called by hotkey or voice."""
+    try:
+        pygame.mixer.music.stop()
+    except Exception:
+        pass
+    log("  [SPEECH INTERRUPTED by user]")
+    hud_event("interrupt")
+    set_status("idle")
 
 
 def run_tray():
@@ -3025,6 +3130,7 @@ def voice_loop():
     threading.Thread(target=window_focus_watcher, daemon=True).start()
     threading.Thread(target=predictive_observer, daemon=True).start()
     threading.Thread(target=shutdown_sentinel_watcher, daemon=True).start()
+    threading.Thread(target=personality_watcher_loop, daemon=True).start()
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=telegram_listen_loop, daemon=True).start()
 
@@ -3107,6 +3213,21 @@ def voice_loop():
                 except Exception: pass
             break
 
+        # STOP keyword — interrupt any active speech, don't even call brain
+        if any(w in cmd_l for w in ["stop talking", "shut up", "be quiet",
+                                     "stop jarvis", "jarvis stop", "silence",
+                                     "stop it", "enough"]):
+            stop_speech()
+            active_until = time.time() + FOLLOWUP_WINDOW
+            continue
+
+        # Custom-command shortcut (defined in personality.yaml)
+        custom_reply = check_custom_command(command)
+        if custom_reply:
+            speak(custom_reply)
+            active_until = time.time() + FOLLOWUP_WINDOW
+            continue
+
         response = react_loop(command, speak_progress=True)
         if response: speak(response)
         active_until = time.time() + FOLLOWUP_WINDOW
@@ -3116,6 +3237,14 @@ def main():
     if TRAY_MODE and PYSTRAY_AVAILABLE and PIL_AVAILABLE:
         install_silent_stdout()
         threading.Thread(target=voice_loop, daemon=True, name="VoiceLoop").start()
+        # Register global hotkeys (work from any app, any time)
+        try:
+            import keyboard as _kb
+            _kb.add_hotkey("ctrl+shift+s", stop_speech)
+            _kb.add_hotkey("windows+j",   _tray_show_hud)
+            log("  Global hotkeys ............... ONLINE (Ctrl+Shift+S = stop, Win+J = HUD)")
+        except Exception as e:
+            log(f"  [Global hotkeys unavailable: {e}]")
         run_tray()
     else:
         voice_loop()

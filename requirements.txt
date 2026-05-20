@@ -38,5 +38,8 @@ keyboard>=0.13.5          # Global hotkeys (Win+J)
 win11toast>=0.36.0        # Windows toast notifications
 python-telegram-bot>=21.6 # Two-way Telegram messaging
 openai>=1.0.0             # Used as Ollama compatible client for local fallback
+
+# ── Phase 8: personality config + autostart polish ──
+PyYAML>=6.0               # personality.yaml hot-reload
 # Plus install cloudflared CLI separately:
 # https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/

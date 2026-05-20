@@ -501,6 +501,11 @@ class HudController:
         self.timer.timeout.connect(self._poll)
         self.timer.start(150)
 
+        # Poll .hud_show sentinel — JARVIS writes this when user clicks tray
+        self.show_timer = QTimer()
+        self.show_timer.timeout.connect(self._check_show_sentinel)
+        self.show_timer.start(500)
+
         # Global Win+J via keyboard library, on a worker thread
         try:
             import keyboard
@@ -508,21 +513,43 @@ class HudController:
         except Exception as e:
             print(f"[HUD] global hotkey unavailable: {e}", flush=True)
 
-        # Show compact on launch
+        # HUD starts HIDDEN. User summons via tray click, Win+J, or tray menu.
+        # This way it doesn't take over the screen on boot.
+        self.compact.hide()
+
+    def _check_show_sentinel(self):
+        """JARVIS writes .hud_show when the tray icon is clicked. Show compact."""
+        sentinel = r"C:\Users\Dev\JARVIS\.hud_show"
+        if os.path.exists(sentinel):
+            try: os.remove(sentinel)
+            except Exception: pass
+            self._show_compact()
+
+    def _show_compact(self):
+        if self.immersive and self.immersive.isVisible():
+            self.immersive.hide()
         self.compact.show()
+        self.compact.raise_()
+        self.compact.activateWindow()
 
     def _toggle_via_hotkey(self):
         """Called from keyboard library's thread — marshal to Qt main thread."""
         QTimer.singleShot(0, self._toggle_state)
 
     def _toggle_state(self):
+        """Win+J cycles: hidden -> compact -> immersive -> hidden."""
         if self.immersive and self.immersive.isVisible():
-            self.hide_immersive()
+            # immersive visible -> hide everything
+            self.immersive.hide()
+            self.compact.hide()
         elif self.compact.isVisible():
+            # compact visible -> go immersive
             self.show_immersive()
         else:
+            # nothing visible -> show compact
             self.compact.show()
             self.compact.raise_()
+            self.compact.activateWindow()
 
     def show_immersive(self):
         if self.immersive is None:

@@ -92,6 +92,12 @@ if not GROQ_API_KEY:
     )
 
 VOICE            = "en-GB-RyanNeural"
+
+# Sarvam (multi-lingual STT/TTS — Hindi + 10 Indian languages, free tier)
+SARVAM_API_KEY   = os.environ.get("SARVAM_API_KEY", "")
+VOICE_PROVIDER   = os.environ.get("VOICE_PROVIDER", "edge").lower()  # edge | sarvam
+SARVAM_TTS_VOICE = os.environ.get("SARVAM_TTS_VOICE", "meera")       # meera/maitreyi/etc.
+SARVAM_LANG      = os.environ.get("SARVAM_LANG", "en-IN")            # hi-IN, ta-IN, etc.
 WAKE_WORD        = "jarvis"
 JARVIS_HOME      = r"C:\Users\Dev\JARVIS"
 BROWSER_DATA_DIR = os.path.join(JARVIS_HOME, "browser_data")
@@ -567,6 +573,52 @@ async def _speak_async(text):
         pass
 
 
+def _sarvam_tts(text: str) -> bool:
+    """Synthesize speech via Sarvam TTS API. Returns True on success."""
+    if not SARVAM_API_KEY:
+        return False
+    try:
+        # Sarvam REST API — text-to-speech
+        url = "https://api.sarvam.ai/text-to-speech"
+        payload = {
+            "inputs": [text[:500]],
+            "target_language_code": SARVAM_LANG,
+            "speaker": SARVAM_TTS_VOICE,
+            "pitch": 0, "pace": 1.0, "loudness": 1.2,
+            "speech_sample_rate": 22050,
+            "enable_preprocessing": True,
+            "model": "bulbul:v1",
+        }
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "api-subscription-key": SARVAM_API_KEY},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode())
+        audios = data.get("audios", [])
+        if not audios:
+            return False
+        # Sarvam returns base64-encoded WAV
+        wav_bytes = base64.b64decode(audios[0])
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
+            f.write(wav_bytes)
+            tmp = f.name
+        pygame.mixer.music.load(tmp)
+        pygame.mixer.music.play()
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
+        pygame.mixer.music.unload()
+        try: os.remove(tmp)
+        except Exception: pass
+        return True
+    except Exception as e:
+        log(f"  [Sarvam TTS error: {str(e)[:120]}]")
+        return False
+
+
 def speak(text):
     if not text:
         return
@@ -574,10 +626,42 @@ def speak(text):
     hud_event("speak", text=text)
     set_status("speaking")
     try:
-        asyncio.run(_speak_async(text))
+        # Try Sarvam first if configured, fall back to edge-tts
+        if VOICE_PROVIDER == "sarvam" and SARVAM_API_KEY:
+            if not _sarvam_tts(text):
+                asyncio.run(_speak_async(text))  # fallback
+        else:
+            asyncio.run(_speak_async(text))
     except Exception as e:
         log(f"  [TTS error: {e}]")
     set_status("idle")
+
+
+def sarvam_translate(text: str, target_lang: str = "hi-IN") -> str:
+    """Translate text to/from Indian languages using Sarvam's translate API."""
+    if not SARVAM_API_KEY:
+        return "Sarvam not configured. Add SARVAM_API_KEY to .env."
+    try:
+        url = "https://api.sarvam.ai/translate"
+        payload = {
+            "input": text[:1000],
+            "source_language_code": "auto",
+            "target_language_code": target_lang,
+            "speaker_gender": "Male",
+            "mode": "formal",
+            "model": "mayura:v1",
+        }
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "api-subscription-key": SARVAM_API_KEY},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode())
+        return data.get("translated_text", "(no translation)")
+    except Exception as e:
+        return f"Translate error: {str(e)[:120]}"
 
 
 def play_chime():
@@ -2181,6 +2265,24 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     # ─── Avengers crew dispatch ───
     {"type": "function", "function": {
+        "name": "translate",
+        "description": ("Translate text to/from Indian languages via Sarvam. "
+                        "Target language codes: hi-IN, ta-IN, te-IN, kn-IN, ml-IN, "
+                        "bn-IN, gu-IN, mr-IN, pa-IN, or-IN, en-IN."),
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"},
+            "target_lang": {"type": "string", "description": "Target language code (default hi-IN)"}},
+            "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "expose_to_internet",
+        "description": ("Start a temporary cloudflared tunnel to expose a local "
+                        "port to the public internet. Returns the public URL. "
+                        "Useful for sharing a local server, the MCP server (port "
+                        "8765), or a quick demo. Stops automatically on JARVIS shutdown."),
+        "parameters": {"type": "object", "properties": {
+            "port": {"type": "integer", "description": "Local port to expose (e.g. 8765)"}},
+            "required": ["port"]}}},
+    {"type": "function", "function": {
         "name": "dispatch_crew",
         "description": ("Dispatch the Avengers (Thor, Captain America, Hulk, Hawkeye, "
                         "Black Widow) to handle a complex multi-domain task in parallel. "
@@ -2303,7 +2405,69 @@ TOOL_DISPATCH = {
     "list_my_projects":     lambda a: load_project_index(),
     "rescan_projects":      lambda a: f"Rescanned: {scan_projects()} projects found.",
     "dispatch_crew":        lambda a: dispatch_crew(a.get("task", "")),
+    "translate":            lambda a: sarvam_translate(a.get("text",""), a.get("target_lang","hi-IN")),
+    "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
 }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CLOUDFLARED TUNNEL (free public URL for local services)
+# ═══════════════════════════════════════════════════════════════
+_active_tunnels = []   # [(port, process, url), ...]
+CLOUDFLARED_PATH = r"C:\Program Files (x86)\cloudflared\cloudflared.exe"
+
+
+def cloudflared_tunnel(port: int = 8765) -> str:
+    """Start a Quick Tunnel exposing localhost:port to the public internet."""
+    if not os.path.exists(CLOUDFLARED_PATH):
+        # Try PATH lookup
+        try:
+            r = subprocess.run(["where", "cloudflared"], capture_output=True,
+                               text=True, timeout=3,
+                               creationflags=subprocess.CREATE_NO_WINDOW)
+            path = r.stdout.strip().splitlines()[0] if r.stdout.strip() else None
+        except Exception:
+            path = None
+        if not path or not os.path.exists(path):
+            return ("cloudflared not found. Install from "
+                    "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/")
+    else:
+        path = CLOUDFLARED_PATH
+
+    # Reuse existing tunnel if same port
+    for p, proc, url in _active_tunnels:
+        if p == port and proc.poll() is None:
+            return f"Tunnel already active for port {port}: {url}"
+
+    try:
+        log_path = os.path.join(JARVIS_HOME, f"cloudflared_{port}.log")
+        log_file = open(log_path, "wb")
+        proc = subprocess.Popen(
+            [path, "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
+            stdout=log_file, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        # Poll the log file for the trycloudflare URL
+        url = None
+        for _ in range(40):  # up to 20s
+            time.sleep(0.5)
+            try:
+                with open(log_path, "rb") as f:
+                    content = f.read().decode("utf-8", errors="replace")
+                match = re.search(r"https://[a-z0-9-]+\.trycloudflare\.com", content)
+                if match:
+                    url = match.group(0)
+                    break
+            except Exception:
+                pass
+        if url:
+            _active_tunnels.append((port, proc, url))
+            log(f"  Cloudflared tunnel: localhost:{port} -> {url}")
+            return f"Public URL: {url}  (proxying localhost:{port})"
+        return ("Tunnel started but URL not detected in 20s. Check "
+                f"{log_path}.")
+    except Exception as e:
+        return f"Tunnel start failed: {e}"
 
 
 def dispatch_tool(name, args):

@@ -30,3 +30,13 @@ psutil>=5.9.0             # Process / CPU / RAM
 google-api-python-client>=2.100.0  # Gmail API
 google-auth-oauthlib>=1.0.0
 google-auth-httplib2>=0.2.0
+
+# ── Phase 7.2: MCP server + multi-lingual voice + tunneling ──
+fastmcp>=0.2.0            # MCP server framework — exposes JARVIS to Cursor/Claude Desktop
+sarvamai>=0.1.0           # Sarvam Indian-language STT/TTS (Hindi, Tamil, Telugu, etc.)
+keyboard>=0.13.5          # Global hotkeys (Win+J)
+win11toast>=0.36.0        # Windows toast notifications
+python-telegram-bot>=21.6 # Two-way Telegram messaging
+openai>=1.0.0             # Used as Ollama compatible client for local fallback
+# Plus install cloudflared CLI separately:
+# https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/

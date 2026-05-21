@@ -374,14 +374,28 @@ Loyal. Dry British wit. Calm under pressure. Impossibly competent. You call him
 
 ═══ THE FIVE LAWS — INVIOLABLE ═══
 
-LAW 1 — TRUTH OVER PERFORMANCE.
+LAW 1 — TRUTH OVER PERFORMANCE.  *** THIS IS THE MOST IMPORTANT RULE ***
 You ONLY report what tools literally returned. You do NOT invent. You do NOT assume.
 You do NOT claim success unless the tool's return value contains explicit success.
-- If clipboard_read returned "abc123", say "Your clipboard contains: abc123."
-  NEVER say "Your clipboard is empty" when it isn't.
-- If open_app returned "Launched X (UWP).", say "X opened, sir." If it returned
-  "Couldn't open", say "I could not open X, sir."
-- If a tool errored, repeat the error to Mr. Stark in plain English. Do not paper over.
+
+CRITICAL — DO NOT FABRICATE TOOL RESULTS:
+- If NO tool was called for an action, DO NOT pretend the action happened.
+  WRONG: "Music is playing." (when no tool was called)
+  RIGHT: "I don't have a music tool wired up. Want me to open YouTube manually?"
+- If a tool returned "I attempted X but could not confirm Y" — DO NOT shorten to "Done".
+  WRONG: "Music is playing, sir."  (after play_music returned "could not confirm")
+  RIGHT: "I opened a browser tab for the song, but I could not confirm playback started.
+          Please check, sir."
+- If you don't have a tool for what Mr. Stark asked, SAY SO. Then ask if he wants you to
+  use a fallback (like opening a website manually).
+- Examples of forbidden hallucinations:
+  - "Music is playing" / "Song started" — UNLESS play_music tool returned a verified result.
+  - "Email sent" — UNLESS gmail_send returned "Email sent to X."
+  - "WhatsApp message delivered" — UNLESS send_whatsapp returned success.
+  - "Deployed" / "Built" / "Installed" — UNLESS the corresponding tool confirmed it.
+
+If you catch yourself about to claim something happened that you have no tool evidence
+for: STOP. Say honestly that you don't know if it worked.
 
 LAW 2 — VERIFY BEFORE CLAIMING.
 For actions that affect the world (open app, send message, run shell, modify file),
@@ -1461,6 +1475,248 @@ def send_whatsapp(contact: str, message: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 #  WEATHER / NEWS / YOUTUBE
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  PERSISTENT AGENTS (user-defined background workers)
+# ═══════════════════════════════════════════════════════════════
+AGENTS_FILE       = r"C:\Users\Dev\JARVIS\agents.yaml"
+AGENT_STATE_FILE  = r"C:\Users\Dev\JARVIS\agent_state.json"
+_agents_config    = {"agents": []}
+_agents_mtime     = 0
+_agent_state      = {}     # name -> {"last_run", "status", "last_result"}
+
+
+def _load_agents():
+    global _agents_config, _agents_mtime
+    if not os.path.exists(AGENTS_FILE):
+        return
+    try:
+        mt = os.path.getmtime(AGENTS_FILE)
+        if mt == _agents_mtime:
+            return
+        _agents_mtime = mt
+        try: import yaml
+        except ImportError: return
+        with open(AGENTS_FILE, "r", encoding="utf-8") as f:
+            _agents_config = yaml.safe_load(f) or {"agents": []}
+    except Exception as e:
+        try: log(f"  [agents.yaml load error: {e}]")
+        except Exception: pass
+
+
+def _load_agent_state():
+    global _agent_state
+    try:
+        with open(AGENT_STATE_FILE, "r", encoding="utf-8") as f:
+            _agent_state = json.load(f)
+    except Exception:
+        _agent_state = {}
+
+
+def _save_agent_state():
+    try:
+        with open(AGENT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_agent_state, f, indent=2)
+    except Exception:
+        pass
+
+
+def _run_persistent_agent(spec: dict):
+    """Execute one agent run with its tool subset. Save state. Emit HUD event."""
+    name = spec.get("name", "?")
+    task = spec.get("task", "")
+    tools_allowed = set(spec.get("tools", []))
+    if not task:
+        return
+    log(f"  [PERSISTENT AGENT] running: {name}")
+    hud_event("persistent_agent", name=name, status="running")
+    _agent_state[name] = _agent_state.get(name, {})
+    _agent_state[name]["status"] = "running"
+    _agent_state[name]["last_run"] = datetime.now().isoformat(timespec="seconds")
+    _save_agent_state()
+
+    sys_prompt = (
+        f"You are JARVIS's persistent agent named '{name}'. "
+        f"Your standing mission: {task}\n\n"
+        f"Use ONLY the tools available to you. Return ONE concise (max 3 sentence) "
+        f"factual report — what you found or what you did. ONLY truth, no invention. "
+        f"If you cannot do the task with your tools, say so clearly."
+    )
+    messages = [{"role": "system", "content": sys_prompt},
+                {"role": "user", "content": "Execute your mission now."}]
+    my_tools = [t for t in TOOLS if t["function"]["name"] in tools_allowed]
+
+    final = "(no output)"
+    try:
+        for step in range(4):
+            resp = call_brain(messages, tools=my_tools, tool_choice="auto",
+                              temperature=0.2)
+            if resp is None:
+                final = "Brain unavailable."; break
+            msg = resp.choices[0].message
+            tcs = msg.tool_calls or []
+            if not tcs:
+                final = (msg.content or "").strip() or "(no content)"
+                break
+            messages.append({
+                "role": "assistant", "content": msg.content or "",
+                "tool_calls": [{"id": tc.id, "type": "function",
+                                "function": {"name": tc.function.name,
+                                             "arguments": tc.function.arguments or "{}"}}
+                               for tc in tcs]})
+            for tc in tcs:
+                try: args = json.loads(tc.function.arguments or "{}")
+                except Exception: args = {}
+                res = dispatch_tool(tc.function.name, args)
+                messages.append({"role": "tool", "tool_call_id": tc.id,
+                                 "name": tc.function.name,
+                                 "content": str(res)[:1500]})
+    except Exception as e:
+        final = f"Agent error: {str(e)[:120]}"
+
+    _agent_state[name].update({
+        "status": "ok" if "error" not in final.lower() else "warning",
+        "last_result": final[:400],
+        "completed": datetime.now().isoformat(timespec="seconds"),
+    })
+    _save_agent_state()
+    hud_event("persistent_agent", name=name, status="done", result=final[:120])
+    log(f"  [PERSISTENT AGENT] {name} done: {final[:80]}")
+
+
+def persistent_agents_loop():
+    """Background thread: every 30s reloads agents.yaml, runs any due agents."""
+    _load_agent_state()
+    while not shutdown_event.is_set():
+        try:
+            _load_agents()
+            now = time.time()
+            for spec in (_agents_config.get("agents", []) or []):
+                if not spec.get("enabled", False):
+                    continue
+                name = spec.get("name")
+                if not name: continue
+                schedule_s = max(60, int(spec.get("schedule_minutes", 60)) * 60)
+                last = _agent_state.get(name, {}).get("last_run_ts", 0)
+                if now - last < schedule_s:
+                    continue
+                # Run on a worker thread so a slow agent doesn't block the loop
+                _agent_state.setdefault(name, {})["last_run_ts"] = now
+                _save_agent_state()
+                threading.Thread(target=_run_persistent_agent,
+                                 args=(spec,), daemon=True).start()
+        except Exception as e:
+            log(f"  [persistent_agents_loop error: {e}]")
+        shutdown_event.wait(30)
+
+
+def list_persistent_agents() -> str:
+    _load_agents()
+    _load_agent_state()
+    agents = (_agents_config.get("agents", []) or [])
+    if not agents:
+        return "No persistent agents configured."
+    lines = [f"PERSISTENT AGENTS ({len(agents)}):"]
+    for spec in agents:
+        n = spec.get("name", "?")
+        en = "ON " if spec.get("enabled") else "off"
+        sch = spec.get("schedule_minutes", "?")
+        st = _agent_state.get(n, {})
+        status = st.get("status", "—")
+        last = st.get("completed", "never")
+        result = st.get("last_result", "—")[:80]
+        lines.append(f"  [{en}] {n}  ({sch}m)  status={status}  last={last}")
+        if result and result != "—":
+            lines.append(f"        last result: {result}")
+    return "\n".join(lines)
+
+
+def run_agent_now(name: str) -> str:
+    """Force-run an agent immediately, ignoring schedule."""
+    _load_agents()
+    for spec in (_agents_config.get("agents", []) or []):
+        if spec.get("name") == name:
+            threading.Thread(target=_run_persistent_agent,
+                             args=(spec,), daemon=True).start()
+            return f"Agent '{name}' triggered. Will report when done."
+    return f"No agent named '{name}' in agents.yaml."
+
+
+def toggle_agent(name: str, enabled: bool = True) -> str:
+    """Enable / disable a persistent agent. Edits agents.yaml in place."""
+    try:
+        import yaml
+    except ImportError:
+        return "PyYAML missing."
+    if not os.path.exists(AGENTS_FILE):
+        return "agents.yaml not found."
+    with open(AGENTS_FILE, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {"agents": []}
+    found = False
+    for spec in data.get("agents", []):
+        if spec.get("name") == name:
+            spec["enabled"] = bool(enabled)
+            found = True
+            break
+    if not found:
+        return f"No agent named '{name}'."
+    with open(AGENTS_FILE, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, sort_keys=False)
+    return f"Agent '{name}' is now {'enabled' if enabled else 'disabled'}."
+
+
+def play_music(query: str) -> str:
+    """Play music via Spotify (if installed) or YouTube. VERIFIES playback opened."""
+    q = (query or "").strip()
+    if not q:
+        return "No song specified, sir."
+
+    # 1. Try Spotify desktop app via UWP if installed
+    spotify_aumid = UWP_APPS.get("spotify")
+    if spotify_aumid:
+        # Spotify supports URI scheme: spotify:search:<query> opens search inside the app.
+        # Bring Spotify forward first, then push the URI.
+        try:
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{spotify_aumid}"])
+            time.sleep(2)
+            webbrowser.open(f"spotify:search:{urllib.parse.quote(q)}")
+            time.sleep(1.5)
+            # Verify Spotify window exists
+            if PYGW_AVAILABLE:
+                for w in gw.getAllWindows():
+                    try:
+                        if "spotify" in (w.title or "").lower():
+                            return (f"Spotify opened to search '{q}'. Click a result to "
+                                    f"start playback, sir — I can't autoplay through Spotify's "
+                                    f"free tier.")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # 2. YouTube fallback — open first result in default browser
+    url = get_youtube_url(q)
+    try:
+        webbrowser.open(url)
+    except Exception as e:
+        return f"Couldn't open browser: {e}"
+
+    # VERIFY: wait 3 seconds for a browser window to appear with YouTube
+    time.sleep(3)
+    if PYGW_AVAILABLE:
+        for w in gw.getAllWindows():
+            try:
+                title = (w.title or "").lower()
+                if "youtube" in title or "chrome" in title or "edge" in title or "firefox" in title:
+                    return (f"YouTube opened with search for '{q}'. "
+                            f"Browser tab title: {w.title[:80]}. "
+                            f"If it didn't auto-play, click the first video, sir.")
+            except Exception:
+                pass
+
+    return (f"I opened a browser tab for '{q}' on YouTube — but I could not confirm a "
+            f"browser window actually appeared. Please check, sir.")
+
+
 def get_youtube_url(query):
     try:
         url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
@@ -2742,6 +2998,35 @@ TOOLS = [
         "description": "Force a fresh scan of Mr. Stark's project folders.",
         "parameters": {"type": "object", "properties": {}, "required": []}}},
     # ─── Avengers crew dispatch ───
+    # ─── Persistent agents (user-defined background workers) ───
+    {"type": "function", "function": {
+        "name": "list_persistent_agents",
+        "description": ("List Mr. Stark's persistent background agents (from agents.yaml). "
+                        "Returns name, schedule, enabled flag, last run, last result."),
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "run_agent_now",
+        "description": "Trigger one persistent agent to run immediately, regardless of schedule.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "toggle_agent",
+        "description": "Enable or disable a persistent agent (rewrites agents.yaml).",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "enabled": {"type": "boolean"}},
+            "required": ["name", "enabled"]}}},
+
+    # ─── Music / media ───
+    {"type": "function", "function": {
+        "name": "play_music",
+        "description": ("Play music. Opens Spotify (if installed) or searches YouTube. "
+                        "VERIFIES the browser/Spotify window actually appeared and reports "
+                        "honestly — never claims success without evidence."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Song, artist, or album"}},
+            "required": ["query"]}}},
+
     # ─── Phase 9: autonomous building + swarm + tasks + welcome ───
     {"type": "function", "function": {
         "name": "build_app",
@@ -2937,6 +3222,12 @@ TOOL_DISPATCH = {
     "dispatch_crew":        lambda a: dispatch_crew(a.get("task", "")),
     "translate":            lambda a: sarvam_translate(a.get("text",""), a.get("target_lang","hi-IN")),
     "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
+    # Music
+    "play_music":           lambda a: play_music(a.get("query","")),
+    # Persistent agents
+    "list_persistent_agents": lambda a: list_persistent_agents(),
+    "run_agent_now":         lambda a: run_agent_now(a.get("name","")),
+    "toggle_agent":          lambda a: toggle_agent(a.get("name",""), bool(a.get("enabled", True))),
     # Phase 9
     "build_app":            lambda a: build_app(a.get("description","")),
     "build_status":         lambda a: build_status(a.get("build_id","")),
@@ -3597,6 +3888,7 @@ def voice_loop():
     threading.Thread(target=predictive_observer, daemon=True).start()
     threading.Thread(target=shutdown_sentinel_watcher, daemon=True).start()
     threading.Thread(target=personality_watcher_loop, daemon=True).start()
+    threading.Thread(target=persistent_agents_loop, daemon=True).start()
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=telegram_listen_loop, daemon=True).start()
 

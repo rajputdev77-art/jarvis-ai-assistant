@@ -654,6 +654,20 @@ class HudController:
         elif kind == "predictive":
             for t in targets:
                 if hasattr(t, "stream"): t.stream.add("predictive", evt.get("text", "")[:140])
+        elif kind == "persistent_agent":
+            name = evt.get("name", "?")
+            status = evt.get("status", "?")
+            result = evt.get("result", "")
+            text = (f"[{name}] {status}" + (f" — {result[:80]}" if result else ""))
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("agent_start", text)
+        elif kind == "build_progress":
+            text = f"[BUILD {evt.get('build_id','?')}] {evt.get('status','?')}: {evt.get('message','')[:80]}"
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("agent_start", text)
+        elif kind == "interrupt":
+            for t in targets:
+                if hasattr(t, "stream"): t.stream.add("speak", "(speech interrupted)")
         elif kind == "shutdown":
             QApplication.quit()
 

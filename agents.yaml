@@ -1,0 +1,64 @@
+# ═══════════════════════════════════════════════════════════════
+# JARVIS Persistent Agents
+# Each agent runs on its own schedule, doing one job over and over.
+# Edit this file — JARVIS hot-reloads every 30 seconds.
+# Add as many as you want. Use `enabled: false` to pause one.
+# ═══════════════════════════════════════════════════════════════
+
+agents:
+  # ── Instagram content monitor ──────────────────────────────────
+  - name: instagram_monitor
+    enabled: false                    # ← set to true once you connect your account
+    schedule_minutes: 60
+    task: |
+      Check Mr. Stark's Instagram engagement. Open https://instagram.com if accessible.
+      Look at the top 3 most recent posts. Report likes, comments, and any sudden
+      changes. If there is a problem (account locked, post removed, etc.), flag it.
+      Be concise — maximum 3 sentences.
+    tools: [http_get, run_shell, analyze_screen, list_windows]
+
+  # ── Trading app health check ──────────────────────────────────
+  - name: trading_monitor
+    enabled: false                    # ← set to true to start watching
+    schedule_minutes: 30
+    task: |
+      Verify the Trading project. Check the folder C:\Users\Dev\Desktop\Trading.
+      If there is a log file, read the last 30 lines for errors or PnL.
+      Check if any python process related to trading is running.
+      Report a one-line health summary.
+    tools: [verify_app_running, read_file, list_dir, find_files, list_processes]
+
+  # ── Video editing watchdog ────────────────────────────────────
+  - name: video_editor
+    enabled: false
+    schedule_minutes: 120
+    task: |
+      List new files in C:\Users\Dev\Videos\ that were modified in the last 24 hours.
+      Suggest titles and a brief description for each.
+      If no new files, report 'No new videos to edit.'
+    tools: [list_dir, find_files, run_shell]
+
+  # ── System overview — runs every 6 hours ──────────────────────
+  - name: overview_audit
+    enabled: true                     # ← runs out-of-the-box
+    schedule_minutes: 360
+    task: |
+      Quick 4-point audit of Mr. Stark's system:
+      1. Disk space on C: drive (warn if under 20 GB free)
+      2. Number of recent project edits in the last 24h
+      3. Battery health
+      4. Any long-running python processes that have been idle.
+      Report each as a single line. Total under 6 lines.
+    tools: [system_status, run_shell, list_processes, list_my_projects]
+
+  # ── Daily briefing prep — once at 8 AM ────────────────────────
+  - name: morning_briefing_prep
+    enabled: true
+    schedule_minutes: 480              # roughly twice per 16-hour day
+    task: |
+      Prepare a morning-briefing draft for Mr. Stark. Include:
+      - Today's weather in Greater Noida
+      - Pending task count
+      - Top recent project
+      - One motivational line in JARVIS's British butler voice.
+    tools: [get_weather, list_tasks, list_my_projects]

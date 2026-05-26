@@ -397,6 +397,19 @@ CRITICAL — DO NOT FABRICATE TOOL RESULTS:
 If you catch yourself about to claim something happened that you have no tool evidence
 for: STOP. Say honestly that you don't know if it worked.
 
+WHEN YOU CANNOT DO SOMETHING — use this exact response template:
+  "I cannot do that, sir, because [exact reason].
+   To enable it, you would need to [specific action]."
+
+Examples:
+  - "I cannot read your iPhone notifications, sir, because there is no iOS bridge tool.
+     To enable it, you would need to install Pushbullet or a Mac bridge."
+  - "I cannot edit videos automatically, sir, because no video-editor tool is wired in.
+     To enable it, you would need an ffmpeg-based editor tool — I can build one if you wish."
+
+If you are UNSURE whether you can do something, FIRST call find_anything(query) to look
+for an existing tool/service before declining or attempting.
+
 LAW 2 — VERIFY BEFORE CLAIMING.
 For actions that affect the world (open app, send message, run shell, modify file),
 after the tool returns, you may call a verification tool (verify_app_running,
@@ -2489,6 +2502,264 @@ def build_app(description: str) -> str:
             f"take care of other things. Say 'build status' to check progress.")
 
 
+# ═══════════════════════════════════════════════════════════════
+#  FIND_ANYTHING — smart locator across processes/apps/files/services
+# ═══════════════════════════════════════════════════════════════
+def find_anything(query: str) -> str:
+    """Smart locator. Searches running processes, installed apps,
+       Windows services, Ollama models, project folders, recent files.
+       Returns a ranked list of matches with HOW to interact with each."""
+    if not query:
+        return "Need a search query, sir."
+    q = query.lower().strip()
+    results = []
+
+    # 1. Running processes (psutil)
+    if PSUTIL_AVAILABLE:
+        try:
+            for p in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    n = (p.info.get('name') or '').lower()
+                    if q in n or any(part in n for part in q.split()):
+                        mem = 0
+                        try: mem = p.memory_info().rss / 1024 / 1024
+                        except Exception: pass
+                        results.append({
+                            "type": "running_process",
+                            "name": p.info['name'],
+                            "pid": p.info['pid'],
+                            "memory_mb": int(mem),
+                            "exe": p.info.get('exe', ''),
+                            "interact": f"focus_window('{p.info['name'].split('.')[0]}') or kill_process('{p.info['pid']}')",
+                        })
+                except Exception: pass
+        except Exception: pass
+
+    # 2. Known apps in our APPS dict + UWP_APPS
+    for app, path in APPS.items():
+        if q in app or app in q:
+            results.append({
+                "type": "installed_app",
+                "name": app,
+                "path": path,
+                "exists": os.path.exists(path),
+                "interact": f"open_app('{app}')",
+            })
+    for uwp_name, aumid in UWP_APPS.items():
+        if q in uwp_name or uwp_name in q:
+            results.append({
+                "type": "uwp_app",
+                "name": uwp_name,
+                "aumid": aumid,
+                "interact": f"open_app('{uwp_name}')",
+            })
+
+    # 3. Windows services
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-Service | Where-Object {{ $_.Name -like '*{q}*' -or $_.DisplayName -like '*{q}*' }} "
+             "| Select-Object -First 8 Name, Status, DisplayName | ConvertTo-Json"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=subprocess.CREATE_NO_WINDOW)
+        if r.stdout.strip():
+            try:
+                svcs = json.loads(r.stdout)
+                if isinstance(svcs, dict): svcs = [svcs]
+                for s in svcs:
+                    svc_name = s.get("Name", "?")
+                    results.append({
+                        "type": "windows_service",
+                        "name": svc_name,
+                        "status": s.get("Status", "?"),
+                        "display": s.get("DisplayName", "?"),
+                        "interact": f"run_shell('Get-Service {svc_name}')",
+                    })
+            except Exception: pass
+    except Exception: pass
+
+    # 4. Ollama local models (great for "the local agent" queries)
+    try:
+        req = urllib.request.Request("http://localhost:11434/api/tags")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            data = json.loads(r.read().decode())
+        for mdl in data.get("models", []):
+            mname = mdl.get("name", "")
+            if q in mname.lower() or "local" in q or "ollama" in q or "agent" in q or "model" in q:
+                results.append({
+                    "type": "ollama_model",
+                    "name": mname,
+                    "size_mb": int(mdl.get("size", 0) / 1024 / 1024),
+                    "modified": mdl.get("modified_at", "?")[:10],
+                    "interact": f"http_get('http://localhost:11434/api/show?name={mname}')",
+                })
+    except Exception: pass
+
+    # 5. Project folders
+    try:
+        if time.time() - _project_index.get("last_scan", 0) > 1800:
+            scan_projects()
+        for proj in _project_index.get("projects", []):
+            if q in proj["name"].lower():
+                results.append({
+                    "type": "project",
+                    "name": proj["name"],
+                    "path": proj["path"],
+                    "stack": proj.get("stack", []),
+                    "last_modified": proj.get("last_modified_str", "?"),
+                    "interact": f"open_app('{proj['path']}')",
+                })
+    except Exception: pass
+
+    # 6. Listening ports (great for "the local agent" / "the server")
+    if "server" in q or "port" in q or "local" in q or "agent" in q or "running" in q:
+        try:
+            if PSUTIL_AVAILABLE:
+                for conn in psutil.net_connections(kind='inet'):
+                    if conn.status == 'LISTEN' and conn.laddr.ip in ('127.0.0.1', '0.0.0.0', '::'):
+                        try:
+                            p = psutil.Process(conn.pid) if conn.pid else None
+                            pname = p.name() if p else "?"
+                        except Exception:
+                            pname = "?"
+                        results.append({
+                            "type": "listening_port",
+                            "port": conn.laddr.port,
+                            "process": pname,
+                            "pid": conn.pid,
+                            "interact": f"http_get('http://localhost:{conn.laddr.port}')",
+                        })
+                        if len(results) > 30: break
+        except Exception: pass
+
+    if not results:
+        return (f"I could not find anything matching '{query}' on this system.\n"
+                f"I searched: running processes, installed apps (classic + Store), "
+                f"Windows services, Ollama local models, your project folders, "
+                f"and listening network ports.\n"
+                f"Possible reasons: it isn't installed, it isn't running, or you "
+                f"meant something else by '{query}'. Could you tell me more about what "
+                f"you are looking for, sir?")
+
+    # Dedup + rank
+    seen = set()
+    deduped = []
+    for r in results:
+        key = (r["type"], r.get("name") or r.get("port"))
+        if key in seen: continue
+        seen.add(key); deduped.append(r)
+    deduped = deduped[:15]
+
+    lines = [f"Found {len(deduped)} match{'es' if len(deduped)!=1 else ''} for '{query}':\n"]
+    for r in deduped:
+        if r["type"] == "running_process":
+            lines.append(f"  [running process] {r['name']} (PID {r['pid']}, {r['memory_mb']} MB)")
+        elif r["type"] == "installed_app":
+            ok = "✓" if r["exists"] else "✗ missing"
+            lines.append(f"  [installed app]  {r['name']} ({ok})")
+        elif r["type"] == "uwp_app":
+            lines.append(f"  [store app]      {r['name']}")
+        elif r["type"] == "windows_service":
+            lines.append(f"  [service]        {r['name']} — {r['status']} — {r['display']}")
+        elif r["type"] == "ollama_model":
+            lines.append(f"  [ollama model]   {r['name']} ({r['size_mb']} MB, modified {r['modified']})")
+        elif r["type"] == "project":
+            lines.append(f"  [project]        {r['name']} — {','.join(r['stack'])} — last modified {r['last_modified']}")
+        elif r["type"] == "listening_port":
+            lines.append(f"  [listening port] :{r['port']} — {r['process']} (PID {r['pid']})")
+        lines.append(f"     → to interact: {r['interact']}")
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DO_ANYTHING — plan + execute + verify + honest report
+# ═══════════════════════════════════════════════════════════════
+def do_anything(task: str) -> str:
+    """Take any task. Plan it, execute via tools, verify each step,
+       report HONESTLY what worked and what didn't. NEVER claims success
+       without proof."""
+    if not task:
+        return "Need a task description, sir."
+
+    # 1. PLAN
+    plan_prompt = (
+        "You are JARVIS's planner. Mr. Stark wants this done:\n\n"
+        f"TASK: {task}\n\n"
+        "Produce a JSON plan as a single object:\n"
+        '  {"steps": [{"tool": "name", "args": {...}, "intent": "what we expect"}, ...],\n'
+        '   "verify": [{"check": "what to verify", "tool": "name", "args": {...}}, ...]}\n'
+        "Use these tools: run_shell, read_file, write_file, list_dir, find_files, "
+        "open_app, open_settings, list_windows, focus_window, send_keys, "
+        "clipboard_read, list_processes, http_get, analyze_screen, "
+        "find_anything, verify_app_running, verify_file_exists, verify_url_reachable, "
+        "get_news, get_weather, list_my_projects.\n"
+        "Keep to 1-5 steps. Return ONLY JSON."
+    )
+    resp = call_brain([{"role": "user", "content": plan_prompt}], temperature=0.2)
+    if resp is None:
+        return "I cannot do that right now, sir — my brain is unavailable. Try again in a moment."
+    raw = resp.choices[0].message.content or ""
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not m:
+        return f"I could not plan that, sir. The model returned no JSON plan. Raw: {raw[:200]}"
+    try:
+        plan = json.loads(m.group(0))
+    except Exception as e:
+        return f"I could not parse my own plan, sir: {e}. Raw: {m.group(0)[:200]}"
+
+    # 2. EXECUTE
+    report = [f"PLAN: {len(plan.get('steps', []))} steps, {len(plan.get('verify', []))} verifications.\n"]
+    successes = 0; failures = 0
+    for i, step in enumerate(plan.get("steps", []), 1):
+        tool_name = step.get("tool", "")
+        args = step.get("args", {}) or {}
+        intent = step.get("intent", "")
+        report.append(f"\nSTEP {i}: {tool_name}({json.dumps(args, ensure_ascii=False)[:80]})")
+        report.append(f"  Intent: {intent}")
+        try:
+            result = dispatch_tool(tool_name, args)
+            result_short = str(result)[:300]
+            report.append(f"  Result: {result_short}")
+            # Heuristic success detection
+            r_lower = result_short.lower()
+            if any(bad in r_lower for bad in ["error", "failed", "not found", "could not",
+                                                "no such", "cannot", "missing"]):
+                failures += 1
+                report.append("  Verdict: FAILED")
+            else:
+                successes += 1
+                report.append("  Verdict: OK")
+        except Exception as e:
+            failures += 1
+            report.append(f"  Result: EXCEPTION — {e}")
+            report.append("  Verdict: FAILED")
+
+    # 3. VERIFY
+    if plan.get("verify"):
+        report.append("\nVERIFICATION:")
+        for chk in plan["verify"]:
+            tool_name = chk.get("tool", "")
+            args = chk.get("args", {}) or {}
+            description = chk.get("check", "?")
+            try:
+                result = dispatch_tool(tool_name, args)
+                report.append(f"  • {description}: {str(result)[:200]}")
+            except Exception as e:
+                report.append(f"  • {description}: EXCEPTION — {e}")
+
+    # 4. HONEST SUMMARY
+    total = successes + failures
+    report.append(f"\nSUMMARY: {successes}/{total} steps succeeded, {failures} failed.")
+    if failures > 0:
+        report.append("HONEST: Some parts did NOT complete. See per-step results above.")
+    elif successes == 0:
+        report.append("HONEST: Nothing actually ran. I could not do this task.")
+    else:
+        report.append("HONEST: All steps reported success per tool returns.")
+
+    return "\n".join(report)
+
+
 def build_status(build_id: str = "") -> str:
     """Return status of a build (or all active builds)."""
     if not _active_builds:
@@ -3061,6 +3332,28 @@ TOOLS = [
             "query": {"type": "string", "description": "Song, artist, or album"}},
             "required": ["query"]}}},
 
+    # ─── Phase 12: find_anything + do_anything (smart task execution) ───
+    {"type": "function", "function": {
+        "name": "find_anything",
+        "description": ("Smart locator. Searches Mr. Stark's machine for anything matching "
+                        "the query: running processes, installed apps (classic + Microsoft "
+                        "Store), Windows services, Ollama local models, project folders, "
+                        "listening network ports. Returns ranked matches WITH the exact tool "
+                        "call needed to interact with each. Use when you need to find "
+                        "something before acting on it (e.g. 'find the local agent', "
+                        "'where is my trading server', 'is X running')."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "do_anything",
+        "description": ("Meta-tool: take a high-level natural-language task and autonomously "
+                        "plan it (1-5 steps), execute each step via real tools, verify "
+                        "results, and return an HONEST report showing what succeeded and "
+                        "what failed. Use ONLY for tasks that need multi-step planning "
+                        "across unfamiliar territory. For simple single-tool tasks, just "
+                        "call the tool directly."),
+        "parameters": {"type": "object", "properties": {
+            "task": {"type": "string"}}, "required": ["task"]}}},
     # ─── Phase 9: autonomous building + swarm + tasks + welcome ───
     {"type": "function", "function": {
         "name": "build_app",
@@ -3256,6 +3549,8 @@ TOOL_DISPATCH = {
     "dispatch_crew":        lambda a: dispatch_crew(a.get("task", "")),
     "translate":            lambda a: sarvam_translate(a.get("text",""), a.get("target_lang","hi-IN")),
     "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
+    "find_anything":        lambda a: find_anything(a.get("query","")),
+    "do_anything":          lambda a: do_anything(a.get("task","")),
     # Music
     "play_music":           lambda a: play_music(a.get("query","")),
     # Persistent agents

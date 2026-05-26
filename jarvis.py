@@ -630,6 +630,12 @@ def listen_for_wake_word():
 
 
 def listen_for_command():
+    # Phase 11: Whisper local (accurate, accent-tolerant)
+    if _VP_AVAILABLE and os.environ.get("STT_PROVIDER", "whisper").lower() == "whisper":
+        try:
+            return _vp.transcribe_microphone(timeout_sec=10.0)
+        except Exception as e:
+            log(f"  [Whisper STT error, falling back to Google: {e}]")
     try:
         with sr.Microphone() as source:
             recognizer.adjust_for_ambient_noise(source, duration=0.3)
@@ -640,6 +646,12 @@ def listen_for_command():
 
 
 def listen_followup():
+    # Phase 11: Whisper for accurate follow-up capture
+    if _VP_AVAILABLE and os.environ.get("STT_PROVIDER", "whisper").lower() == "whisper":
+        try:
+            return _vp.transcribe_microphone(timeout_sec=float(FOLLOWUP_WINDOW))
+        except Exception as e:
+            log(f"  [Whisper STT error, falling back: {e}]")
     try:
         with sr.Microphone() as source:
             audio = recognizer.listen(source, timeout=FOLLOWUP_WINDOW, phrase_time_limit=20)
@@ -715,6 +727,22 @@ def _sarvam_tts(text: str) -> bool:
         return False
 
 
+# ── Phase 11: voice_pipeline (ElevenLabs TTS + Whisper STT) ────
+_vp = None
+_VP_AVAILABLE = False
+try:
+    import importlib.util as _ilu, sys as _sys
+    _vp_path = r"C:\Users\Dev\JARVIS\voice_pipeline.py"
+    if os.path.exists(_vp_path):
+        _spec = _ilu.spec_from_file_location("voice_pipeline", _vp_path)
+        _vp = _ilu.module_from_spec(_spec)
+        _sys.modules["voice_pipeline"] = _vp
+        _spec.loader.exec_module(_vp)
+        _VP_AVAILABLE = True
+except Exception as _vp_err:
+    print(f"[jarvis] voice_pipeline import failed: {_vp_err}")
+
+
 def speak(text):
     if not text:
         return
@@ -722,10 +750,16 @@ def speak(text):
     hud_event("speak", text=text)
     set_status("speaking")
     try:
-        # Try Sarvam first if configured, fall back to edge-tts
-        if VOICE_PROVIDER == "sarvam" and SARVAM_API_KEY:
+        # Phase 11: ElevenLabs (movie quality) via voice_pipeline
+        if _VP_AVAILABLE and os.environ.get("ELEVENLABS_API_KEY") \
+                and os.environ.get("VOICE_PROVIDER", "elevenlabs").lower() == "elevenlabs":
+            ok = _vp.speak_text(text)
+            if not ok:
+                # Fall back to edge-tts
+                asyncio.run(_speak_async(text))
+        elif VOICE_PROVIDER == "sarvam" and SARVAM_API_KEY:
             if not _sarvam_tts(text):
-                asyncio.run(_speak_async(text))  # fallback
+                asyncio.run(_speak_async(text))
         else:
             asyncio.run(_speak_async(text))
     except Exception as e:
@@ -3794,6 +3828,8 @@ def _tray_show_hud(_=None, __=None):
 def stop_speech(_=None, __=None):
     """INTERRUPT — stop JARVIS mid-speech. Called by hotkey or voice."""
     try:
+        if _VP_AVAILABLE:
+            _vp.stop_speaking()
         pygame.mixer.music.stop()
     except Exception:
         pass

@@ -41,5 +41,11 @@ openai>=1.0.0             # Used as Ollama compatible client for local fallback
 
 # ── Phase 8: personality config + autostart polish ──
 PyYAML>=6.0               # personality.yaml hot-reload
+
+# ── Phase 11: movie-quality voice pipeline ──
+faster-whisper>=1.0.0     # Local STT — 5-10x more accurate than Google Speech
+elevenlabs>=2.0.0         # Movie-quality TTS (free 10k chars/mo on free tier)
+sounddevice>=0.5.0        # Low-latency mic capture
+soundfile>=0.13.0         # Audio file I/O
 # Plus install cloudflared CLI separately:
 # https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/

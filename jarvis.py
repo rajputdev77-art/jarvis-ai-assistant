@@ -482,6 +482,8 @@ For unknown requests, fall back to run_shell. PowerShell can do nearly anything.
 # ═══════════════════════════════════════════════════════════════
 client            = Groq(api_key=GROQ_API_KEY)
 session_memory    = []
+_wake_word_listener = None
+_command_queue = None
 mem0_instance     = None
 active_until      = 0
 proactive_spoken  = set()
@@ -762,13 +764,16 @@ def speak(text):
     log(f"  JARVIS: {text}")
     hud_event("speak", text=text)
     set_status("speaking")
+    # Pause wake-word listener so we don't hear ourselves
     try:
-        # Phase 11: ElevenLabs (movie quality) via voice_pipeline
+        if _wake_word_listener is not None:
+            _wake_word_listener.pause()
+    except Exception: pass
+    try:
         if _VP_AVAILABLE and os.environ.get("ELEVENLABS_API_KEY") \
                 and os.environ.get("VOICE_PROVIDER", "elevenlabs").lower() == "elevenlabs":
             ok = _vp.speak_text(text)
             if not ok:
-                # Fall back to edge-tts
                 asyncio.run(_speak_async(text))
         elif VOICE_PROVIDER == "sarvam" and SARVAM_API_KEY:
             if not _sarvam_tts(text):
@@ -777,6 +782,11 @@ def speak(text):
             asyncio.run(_speak_async(text))
     except Exception as e:
         log(f"  [TTS error: {e}]")
+    finally:
+        try:
+            if _wake_word_listener is not None:
+                _wake_word_listener.resume()
+        except Exception: pass
     set_status("idle")
 
 
@@ -1192,9 +1202,9 @@ def take_screenshot(save_path: str = None) -> str:
 
 
 VISION_MODELS = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview",
+    # Phase 13: replaced decommissioned 3.2-vision-preview with current vision-capable models
     "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
 ]
 
 
@@ -3332,6 +3342,41 @@ TOOLS = [
             "query": {"type": "string", "description": "Song, artist, or album"}},
             "required": ["query"]}}},
 
+    # ─── Phase 13: movie-upgrade tools ───
+    {"type": "function", "function": {
+        "name": "portfolio_brief",
+        "description": ("Fetch real-time stock prices for a list of tickers via "
+                        "Yahoo Finance, compute day change, return a synthesised "
+                        "brief. Use for 'how are my stocks doing', morning market brief, "
+                        "or any portfolio question. Tickers can be US (AAPL) or India (RELIANCE.NS)."),
+        "parameters": {"type": "object", "properties": {
+            "tickers": {"type": "string",
+                "description": "Comma-separated tickers e.g. 'AAPL,MSFT,NVDA,RELIANCE.NS'"}},
+            "required": ["tickers"]}}},
+    {"type": "function", "function": {
+        "name": "scout_add",
+        "description": ("Add a persistent background scout that monitors something at an "
+                        "interval and reports findings. Examples: 'NBA scores every hour', "
+                        "'new AI hackathons daily', 'Manchester City news every 6 hours'."),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "query": {"type": "string", "description": "What to scout for"},
+            "interval_min": {"type": "integer", "description": "Minutes between checks"}},
+            "required": ["name", "query"]}}},
+    {"type": "function", "function": {
+        "name": "scout_list",
+        "description": "List all active scouts and their last findings.",
+        "parameters": {"type": "object", "properties": {}, "required": []}}},
+    {"type": "function", "function": {
+        "name": "sparring_session",
+        "description": ("Start an active learning sparring session — JARVIS quizzes "
+                        "Mr. Stark on a topic, corrects answers, adapts difficulty. "
+                        "Example topics: Spanish vocabulary, Python algorithms, "
+                        "acting line readings."),
+        "parameters": {"type": "object", "properties": {
+            "topic": {"type": "string"},
+            "language": {"type": "string", "description": "Language for the session"}},
+            "required": ["topic"]}}},
     # ─── Phase 12: find_anything + do_anything (smart task execution) ───
     {"type": "function", "function": {
         "name": "find_anything",
@@ -3551,6 +3596,11 @@ TOOL_DISPATCH = {
     "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
     "find_anything":        lambda a: find_anything(a.get("query","")),
     "do_anything":          lambda a: do_anything(a.get("task","")),
+    # Phase 13 movie upgrades
+    "portfolio_brief":      lambda a: portfolio_brief(a.get("tickers","")),
+    "scout_add":            lambda a: scout_add(a.get("name",""), a.get("query",""), int(a.get("interval_min", 60))),
+    "scout_list":           lambda a: scout_list(),
+    "sparring_session":     lambda a: sparring_session(a.get("topic",""), a.get("language","English")),
     # Music
     "play_music":           lambda a: play_music(a.get("query","")),
     # Persistent agents
@@ -4204,6 +4254,34 @@ def voice_loop():
     threading.Thread(target=init_memory, daemon=True).start()
     reload_dynamic_tools()
 
+    # ── Phase 13: Whisper-based wake-word listener (always-on, accent-tolerant) ──
+    global _wake_word_listener, _command_queue
+    import queue as _queue_mod
+    _command_queue = _queue_mod.Queue()
+    try:
+        # Load wake_word module
+        import importlib.util as _ilu
+        _ww_spec = _ilu.spec_from_file_location(
+            "wake_word", r"C:\Users\Dev\JARVIS\wake_word.py")
+        _ww_mod = _ilu.module_from_spec(_ww_spec)
+        _ww_spec.loader.exec_module(_ww_mod)
+        if _VP_AVAILABLE and _vp is not None:
+            wm = _vp._get_whisper()
+            def _on_wake(initial_cmd):
+                # Push to queue for voice_loop to process
+                _command_queue.put(initial_cmd)
+                log(f"  [WAKE] queued command: {initial_cmd!r}")
+                hud_event("user_said", text=f"[wake] {initial_cmd}")
+            _wake_word_listener = _ww_mod.WakeWordListener(wm, _on_wake)
+            _wake_word_listener.start()
+            log("  Wake-word listener .......... ONLINE (Whisper-based)")
+        else:
+            _wake_word_listener = None
+            log("  Wake-word listener .......... OFFLINE (Whisper unavailable)")
+    except Exception as e:
+        _wake_word_listener = None
+        log(f"  [Wake-word init failed: {e}]")
+
     threading.Thread(target=lambda: [
         remember("Mr. Stark lives in Greater Noida, India"),
         remember("Mr. Stark is building JARVIS, a personal AI assistant"),
@@ -4220,6 +4298,7 @@ def voice_loop():
     threading.Thread(target=shutdown_sentinel_watcher, daemon=True).start()
     threading.Thread(target=personality_watcher_loop, daemon=True).start()
     threading.Thread(target=persistent_agents_loop, daemon=True).start()
+    threading.Thread(target=_scout_worker, daemon=True, name="ScoutWorker").start()
     if TELEGRAM_BOT_TOKEN:
         threading.Thread(target=telegram_listen_loop, daemon=True).start()
 
@@ -4274,7 +4353,23 @@ def voice_loop():
                 active_until = 0; set_status("idle"); continue
             command = text.strip()
             log(f"  You: {command}")
+        elif _wake_word_listener is not None:
+            # Phase 13: pull from wake-word queue (Whisper triggers it)
+            set_status("idle")
+            try:
+                command = _command_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            set_status("listening")
+            play_chime()
+            if not command or len(command.strip()) < 2:
+                speak("At your service, Mr. Stark.")
+                command = listen_for_command()
+                if not command:
+                    set_status("idle"); continue
+            log(f"  You: {command}")
         else:
+            # Fallback: original Google Speech path
             set_status("idle")
             heard = listen_for_wake_word()
             if heard is None: continue
@@ -4327,6 +4422,153 @@ def voice_loop():
         response = react_loop(command, speak_progress=True)
         if response: speak(response)
         active_until = time.time() + FOLLOWUP_WINDOW
+
+
+# ═══════════════════════════════════════════════════════════════
+#  PHASE 13: MOVIE-UPGRADE IMPLEMENTATIONS
+# ═══════════════════════════════════════════════════════════════
+def portfolio_brief(tickers: str) -> str:
+    """Fetch real prices for tickers via yfinance, compute day change, summarise."""
+    if not tickers:
+        return "I need tickers, sir. Example: 'AAPL,MSFT,RELIANCE.NS'."
+    try:
+        import yfinance as yf
+    except ImportError:
+        return ("I cannot do that, sir, because yfinance is not installed. "
+                "To enable it, run: pip install yfinance")
+    tlist = [t.strip().upper() for t in tickers.split(",") if t.strip()]
+    if not tlist:
+        return "No valid tickers provided."
+    lines = ["MARKET BRIEF:"]
+    total_change = 0.0; total_value = 0.0
+    for t in tlist[:10]:
+        try:
+            tkr = yf.Ticker(t)
+            hist = tkr.history(period="2d", interval="1d")
+            if hist.empty:
+                lines.append(f"  {t:<12}  NO DATA")
+                continue
+            close = float(hist["Close"].iloc[-1])
+            prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else close
+            change = close - prev
+            pct = (change / prev * 100) if prev else 0
+            arrow = "▲" if change >= 0 else "▼"
+            lines.append(f"  {t:<12}  {close:>10.2f}  {arrow} {pct:+.2f}%  ({change:+.2f})")
+            total_change += change; total_value += close
+        except Exception as e:
+            lines.append(f"  {t:<12}  ERROR: {str(e)[:60]}")
+    if total_value > 0:
+        avg_pct = total_change / max(total_value - total_change, 1) * 100
+        lines.append(f"\n  Aggregate move: {avg_pct:+.2f}%")
+    return "\n".join(lines)
+
+
+# Scouts — persistent background watchers
+SCOUTS_FILE = r"C:\Users\Dev\JARVIS\scouts.json"
+_scouts_lock = threading.Lock()
+
+
+def _load_scouts():
+    try:
+        with open(SCOUTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"scouts": []}
+
+
+def _save_scouts(data):
+    try:
+        with open(SCOUTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception: pass
+
+
+def scout_add(name: str, query: str, interval_min: int = 60) -> str:
+    if not name or not query:
+        return "Need name and query, sir."
+    with _scouts_lock:
+        data = _load_scouts()
+        # Update if exists
+        for s in data["scouts"]:
+            if s["name"] == name:
+                s.update({"query": query, "interval_min": interval_min,
+                          "updated": datetime.now().isoformat(timespec="seconds")})
+                _save_scouts(data)
+                return f"Scout '{name}' updated."
+        data["scouts"].append({
+            "name": name, "query": query, "interval_min": interval_min,
+            "last_run": 0, "last_finding": "",
+            "added": datetime.now().isoformat(timespec="seconds"),
+        })
+        _save_scouts(data)
+    return f"Scout '{name}' added — will check '{query[:60]}' every {interval_min} min."
+
+
+def scout_list() -> str:
+    with _scouts_lock:
+        data = _load_scouts()
+    if not data["scouts"]:
+        return "No active scouts."
+    lines = [f"ACTIVE SCOUTS ({len(data['scouts'])}):"]
+    for s in data["scouts"]:
+        last = datetime.fromtimestamp(s.get("last_run", 0)).strftime("%H:%M") if s.get("last_run") else "never"
+        lines.append(f"  • {s['name']} — every {s['interval_min']} min, last run {last}")
+        if s.get("last_finding"):
+            lines.append(f"     latest: {s['last_finding'][:120]}")
+    return "\n".join(lines)
+
+
+def _scout_worker():
+    """Background loop that runs each scout on its interval."""
+    while not shutdown_event.is_set():
+        try:
+            with _scouts_lock:
+                data = _load_scouts()
+            for s in data.get("scouts", []):
+                if shutdown_event.is_set(): break
+                now = time.time()
+                interval_sec = s.get("interval_min", 60) * 60
+                if now - s.get("last_run", 0) < interval_sec:
+                    continue
+                # Run the scout — ask brain for findings
+                prompt = (f"You are a scout. Search the web (via search_web tool) for "
+                          f"this query and return a 1-2 sentence finding:\n\n"
+                          f"QUERY: {s['query']}\n\n"
+                          f"Be specific and concise. Note if no new info.")
+                try:
+                    finding = react_loop(prompt, speak_progress=False)
+                except Exception as e:
+                    finding = f"scout error: {e}"
+                with _scouts_lock:
+                    data = _load_scouts()
+                    for sx in data["scouts"]:
+                        if sx["name"] == s["name"]:
+                            sx["last_run"] = now
+                            sx["last_finding"] = (finding or "")[:300]
+                    _save_scouts(data)
+                log(f"  [SCOUT {s['name']}] {(finding or '')[:120]}")
+                hud_event("scout_finding", name=s["name"], finding=(finding or "")[:200])
+        except Exception as e:
+            log(f"  [Scout worker error: {e}]")
+        shutdown_event.wait(60)
+
+
+def sparring_session(topic: str, language: str = "English") -> str:
+    """Start an active learning session — generate a single quiz prompt."""
+    if not topic:
+        return "Need a topic, sir."
+    prompt = (f"You are an active-learning coach. Generate ONE concise quiz question "
+              f"or practice prompt for Mr. Stark on: {topic}. "
+              f"Target language: {language}. Format: 'Q: ...' on one line. "
+              f"Make it slightly challenging but not impossible.")
+    try:
+        resp = call_brain([{"role": "user", "content": prompt}], temperature=0.7)
+        if resp:
+            q = resp.choices[0].message.content.strip()
+            return f"SPARRING SESSION — {topic} ({language}):\n\n{q}\n\nReply with your answer, sir."
+    except Exception as e:
+        return f"Sparring failed: {e}"
+    return "Sparring failed: brain unavailable."
 
 
 def main():

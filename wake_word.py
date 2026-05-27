@@ -37,12 +37,11 @@ SILENCE_HANG_SEC   = 1.2    # silence to end utterance
 MIN_UTTERANCE_SEC  = 0.4    # ignore noise blips
 MAX_UTTERANCE_SEC  = 25     # safety cap
 
-# Wake-word triggers (Whisper sometimes hears 'jarvis' as variants)
-WAKE_TRIGGERS = {"jarvis", "javis", "jervis", "jarvi", "j.a.r.v.i.s",
-                 "j a r v i s", "java", "service"}  # 'service' is too loose,
-# remove if it triggers too often
-WAKE_TRIGGERS.discard("service")
-WAKE_TRIGGERS.discard("java")  # too many false positives
+# Phase 14: STRICT wake-word — only exact "jarvis" forms.
+# Previous fuzzy matches (javis/jervis/jarvi) were triggering on TV speech.
+# Whisper transcribes "jarvis" reliably enough that fuzzy matching costs more
+# in false positives than it gains.
+WAKE_TRIGGERS = {"jarvis", "j.a.r.v.i.s", "j a r v i s"}
 
 
 def _transcribe(audio: np.ndarray, whisper_model) -> str:

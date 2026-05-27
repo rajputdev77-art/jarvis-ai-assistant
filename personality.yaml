@@ -23,7 +23,7 @@ behavior:
   formality: "high"         # high | medium | casual
   wit: "medium"             # off | low | medium | high
   pushback: true            # JARVIS may disagree with bad ideas
-  proactive: true           # JARVIS may speak up when ambient layer finds something
+  proactive: false          # Phase 14: SILENT by default. JARVIS only speaks when asked.
   follow_up_window: 6       # seconds after JARVIS speaks during which it listens without wake word
   react_max_iter: 12        # max think-act-observe iterations per request
 

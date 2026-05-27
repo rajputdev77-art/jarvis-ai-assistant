@@ -484,6 +484,7 @@ client            = Groq(api_key=GROQ_API_KEY)
 session_memory    = []
 _wake_word_listener = None
 _command_queue = None
+_observer_muted_until = 0  # Phase 14: double-stop mutes observer for 5 min
 mem0_instance     = None
 active_until      = 0
 proactive_spoken  = set()
@@ -2008,6 +2009,7 @@ def window_focus_watcher():
             if active and active.title and active.title != _last_focused_window:
                 _last_focused_window = active.title
                 hud_event("window_focus", title=active.title[:120])
+                note_observation("window_focus", active.title[:200])
         except Exception:
             pass
         shutdown_event.wait(2)
@@ -2032,6 +2034,10 @@ def predictive_observer():
     shutdown_event.wait(60)
     while not shutdown_event.is_set():
         try:
+            # Phase 14: respect double-stop mute
+            if time.time() < _observer_muted_until:
+                shutdown_event.wait(30)
+                continue
             # Don't observe during active conversation
             if time.time() < active_until + 8:
                 shutdown_event.wait(15)
@@ -2087,13 +2093,13 @@ def predictive_observer():
                 "t": time.time(), "text": reply[:200],
             })
 
-            # Speak only if something noteworthy AND not during active session
+            # Phase 14: SILENT observations — log to notes.jsonl, never speak
             up = reply.upper().strip()
             if up != "NOTHING" and "NOTHING" not in up[:15] and len(reply) > 5:
-                if time.time() >= active_until + 8 and TRAY_STATE == "idle":
-                    log(f"  [Predictive observation: {reply[:120]}]")
-                    hud_event("predictive", text=reply[:200])
-                    speak(reply)
+                log(f"  [Predictive observation: {reply[:120]}]")
+                hud_event("predictive", text=reply[:200])
+                note_observation("predictive_screen", reply[:300])
+                # NO speak() — Mr. Stark explicitly asked: do not interrupt.
         except Exception as e:
             log(f"  [Predictive observer error: {e}]")
         shutdown_event.wait(PREDICTIVE_INTERVAL)
@@ -2118,6 +2124,8 @@ def shutdown_sentinel_watcher():
 
 
 def proactive_monitor():
+    # Phase 14: SILENT mode. Observations are LOGGED to notes.jsonl,
+    # never spoken aloud. User asks "what did you notice" to retrieve.
     while not shutdown_event.is_set():
         try:
             now = datetime.now(); hour = now.hour
@@ -2125,13 +2133,13 @@ def proactive_monitor():
                 key = f"late_night_{now.date()}"
                 if key not in proactive_spoken:
                     proactive_spoken.add(key)
-                    speak("Sir, it's past 2 AM. The code will still be here in the morning.")
+                    note_observation("late_night", f"It's {now.strftime('%H:%M')} — past 2 AM. Mr. Stark is still working.")
             pct, state = get_battery()
             if pct is not None and pct <= 15 and state == "on battery":
                 key = f"low_battery_{pct // 5}"
                 if key not in proactive_spoken:
                     proactive_spoken.add(key)
-                    speak(f"Battery critically low at {pct}%, sir. Plug in.")
+                    note_observation("low_battery", f"Battery at {pct}% on battery — should plug in.")
         except Exception:
             pass
         shutdown_event.wait(300)
@@ -2515,6 +2523,62 @@ def build_app(description: str) -> str:
 # ═══════════════════════════════════════════════════════════════
 #  FIND_ANYTHING — smart locator across processes/apps/files/services
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+#  AMBIENT NOTE-TAKER (Phase 14)
+# ═══════════════════════════════════════════════════════════════
+NOTES_FILE = r"C:\Users\Dev\JARVIS\notes.jsonl"
+_notes_lock = threading.Lock()
+
+
+def note_observation(kind: str, text: str, **extra):
+    """Append a single observation to notes.jsonl. Used by all silent observers."""
+    if not text: return
+    entry = {
+        "t": time.time(),
+        "iso": datetime.now().isoformat(timespec="seconds"),
+        "kind": kind,
+        "text": text[:500],
+        **extra,
+    }
+    try:
+        with _notes_lock:
+            with open(NOTES_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def query_notes(hours: int = 4, topic: str = "") -> str:
+    """Read recent notes. When Mr. Stark asks 'what did you notice' or 'what
+       was I doing at 2pm' — JARVIS reads notes.jsonl and answers honestly."""
+    if not os.path.exists(NOTES_FILE):
+        return "No notes recorded yet, sir."
+    try:
+        cutoff = time.time() - hours * 3600
+        rows = []
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try: entry = json.loads(line)
+                except Exception: continue
+                if entry.get("t", 0) < cutoff: continue
+                if topic and topic.lower() not in entry.get("text", "").lower() \
+                        and topic.lower() not in entry.get("kind", "").lower():
+                    continue
+                rows.append(entry)
+        if not rows:
+            return f"No notes in the last {hours}h matching '{topic}'." if topic else f"No notes in the last {hours}h."
+        # Summarize
+        out = [f"NOTES — last {hours}h ({len(rows)} entries):"]
+        for e in rows[-25:]:
+            ts = datetime.fromtimestamp(e["t"]).strftime("%H:%M")
+            out.append(f"  [{ts}] {e['kind']}: {e['text'][:120]}")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Note query error: {e}"
+
+
 def find_anything(query: str) -> str:
     """Smart locator. Searches running processes, installed apps,
        Windows services, Ollama models, project folders, recent files.
@@ -3342,6 +3406,17 @@ TOOLS = [
             "query": {"type": "string", "description": "Song, artist, or album"}},
             "required": ["query"]}}},
 
+    # ─── Phase 14: ambient note-taker ───
+    {"type": "function", "function": {
+        "name": "query_notes",
+        "description": ("Read Mr. Stark's ambient activity notes — what windows he was "
+                        "focused on, what JARVIS observed on the screen, late-night/battery "
+                        "events. Use when he asks 'what was I doing at 2pm', 'what did you "
+                        "notice today', 'what was on my screen this afternoon'."),
+        "parameters": {"type": "object", "properties": {
+            "hours": {"type": "integer", "description": "Look back N hours (default 4)"},
+            "topic": {"type": "string", "description": "Filter by topic substring (optional)"}},
+            "required": []}}},
     # ─── Phase 13: movie-upgrade tools ───
     {"type": "function", "function": {
         "name": "portfolio_brief",
@@ -3596,6 +3671,8 @@ TOOL_DISPATCH = {
     "expose_to_internet":   lambda a: cloudflared_tunnel(int(a.get("port", 8765))),
     "find_anything":        lambda a: find_anything(a.get("query","")),
     "do_anything":          lambda a: do_anything(a.get("task","")),
+    # Phase 14 ambient
+    "query_notes":          lambda a: query_notes(int(a.get("hours", 4)), a.get("topic","")),
     # Phase 13 movie upgrades
     "portfolio_brief":      lambda a: portfolio_brief(a.get("tickers","")),
     "scout_add":            lambda a: scout_add(a.get("name",""), a.get("query",""), int(a.get("interval_min", 60))),
@@ -4014,6 +4091,8 @@ def call_brain(messages, tools=None, tool_choice=None, temperature=0.4,
 
 
 def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
+    # Phase 14: clear interrupt flag at the start of each request
+    _interrupt_event.clear()
     set_status("thinking")
     hud_event("user_said", text=user_input)
     session_memory.append({"role": "user", "content": user_input})
@@ -4027,6 +4106,10 @@ def react_loop(user_input, speak_progress=True, max_iter=REACT_MAX_ITER):
 
     final_text = None
     for step in range(max_iter):
+        # Phase 14: abort if user said "stop" or hit Ctrl+Shift+S
+        if _interrupt_event.is_set():
+            final_text = "Stopped, sir."
+            break
         resp = call_brain(messages, tools=_all_tools(), tool_choice="auto",
                           temperature=0.4)
         if resp is None:
@@ -4170,17 +4253,38 @@ def _tray_show_hud(_=None, __=None):
     launch_hud()
 
 
+# Phase 14: hard interrupt event — checked by react_loop to abort mid-flight
+_interrupt_event = threading.Event()
+_last_stop_time = [0]
+
+
 def stop_speech(_=None, __=None):
-    """INTERRUPT — stop JARVIS mid-speech. Called by hotkey or voice."""
+    """HARD INTERRUPT — stop JARVIS speaking AND abort any in-flight reasoning."""
     try:
         if _VP_AVAILABLE:
             _vp.stop_speaking()
         pygame.mixer.music.stop()
     except Exception:
         pass
-    log("  [SPEECH INTERRUPTED by user]")
+    # Set the interrupt flag so react_loop aborts on next check
+    _interrupt_event.set()
+    # Drain any queued commands so the next 'jarvis' starts fresh
+    try:
+        if _command_queue is not None:
+            while not _command_queue.empty():
+                _command_queue.get_nowait()
+    except Exception: pass
+    log("  [HARD INTERRUPT — speech stopped, reasoning aborted, queue drained]")
     hud_event("interrupt")
     set_status("idle")
+
+    # Phase 14: double-stop within 3 sec → mute background observer for 5 min
+    now = time.time()
+    if now - _last_stop_time[0] < 3:
+        global _observer_muted_until
+        _observer_muted_until = now + 300
+        log("  [Double-stop detected — muting background observer for 5 min]")
+    _last_stop_time[0] = now
 
 
 def run_tray():
@@ -4315,16 +4419,7 @@ def voice_loop():
         launch_hud()
         time.sleep(0.8)  # let HUD draw
 
-    # Windows toast — tells user JARVIS is alive even if tray is hidden
-    try:
-        from win11toast import toast
-        threading.Thread(target=lambda: toast(
-            "JARVIS is online",
-            "HUD opened top-right. Say 'Jarvis' to wake. Right-click tray for menu.",
-            duration="short", on_click=lambda _: launch_hud(),
-        ), daemon=True).start()
-    except Exception as e:
-        log(f"  [Toast unavailable: {e}]")
+    # Phase 14: NO toast on boot. JARVIS is silent unless asked.
 
     # Pre-warm the brain so the FIRST user task doesn't see a cold rate-limit
     def _prewarm():
@@ -4339,7 +4434,9 @@ def voice_loop():
             log(f"  Brain pre-warm error: {e}")
     threading.Thread(target=_prewarm, daemon=True).start()
 
-    speak(greet())
+    # Phase 14: silent boot. JARVIS does NOT speak unless asked.
+    # Just log that it's online. No greeting. No interruption.
+    log(f"  JARVIS online — silently. Say 'Jarvis' when you need me.")
 
     global active_until
     while not shutdown_event.is_set():
